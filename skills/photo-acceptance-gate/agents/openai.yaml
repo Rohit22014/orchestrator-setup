@@ -1,0 +1,4 @@
+interface:
+  display_name: "Photo Acceptance Gate"
+  short_description: "Prove ticket acceptance before completion"
+  default_prompt: "Use $photo-acceptance-gate to verify this ticket against every acceptance criterion."

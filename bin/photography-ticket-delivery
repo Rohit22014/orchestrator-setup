@@ -1,0 +1,1912 @@
+#!/usr/bin/env python3
+"""Guarded ticket-to-draft-PR delivery for the photography platform."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterable
+from urllib.parse import quote
+
+
+CANONICAL_APP_REPO = Path("/home/rohit/photography-portfolio-platform-app")
+APP_REPO = CANONICAL_APP_REPO
+APP_SLUG = "Rohit22014/photography-portfolio-platform-app"
+TICKET_SLUG = APP_SLUG
+EXPECTED_ORIGIN = f"https://github.com/{APP_SLUG}.git"
+PROJECT_OWNER = "Rohit22014"
+PROJECT_NUMBER = 1
+ALLOWED_BASES = {"main", "frontend", "backend"}
+ALLOWED_STATUSES = {"Todo", "In Progress", "In Review", "Done"}
+STATE_SCHEMA = 1
+PROTECTED_TOP_LEVEL = {
+    ".agents",
+    ".claude",
+    ".codex",
+    ".opencode",
+}
+PROTECTED_FILES = {
+    "AGENTS.md",
+    "CLAUDE.md",
+    "opencode.json",
+}
+FORBIDDEN_GIT_ENVIRONMENT = {
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_WORK_TREE",
+}
+
+
+class DeliveryError(RuntimeError):
+    pass
+
+
+def fail(message: str) -> None:
+    raise DeliveryError(message)
+
+
+def direct_git(root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def direct_git_output(root: Path, args: list[str]) -> str:
+    result = direct_git(root, args)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic output"
+        fail(f"Git repository inspection failed: {detail}")
+    return result.stdout.strip()
+
+
+def resolve_git_path(root: Path, raw: str) -> Path:
+    path = Path(raw)
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
+
+
+def registered_worktrees() -> set[Path]:
+    raw = direct_git_output(CANONICAL_APP_REPO, ["worktree", "list", "--porcelain"])
+    roots = set()
+    for line in raw.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        value = line.removeprefix("worktree ")
+        if not value or any(ord(character) < 32 for character in value):
+            fail("Git returned an unsafe registered-worktree path")
+        roots.add(Path(value).resolve())
+    if CANONICAL_APP_REPO.resolve() not in roots:
+        fail("The canonical implementation repository is not a registered worktree")
+    return roots
+
+
+def common_git_directory(root: Path) -> Path:
+    raw = direct_git_output(root, ["rev-parse", "--git-common-dir"])
+    return resolve_git_path(root, raw)
+
+
+def select_app_worktree(invocation_directory: Path) -> Path:
+    overrides = sorted(FORBIDDEN_GIT_ENVIRONMENT.intersection(os.environ))
+    if overrides:
+        fail(
+            "Git environment overrides are not accepted: " + ", ".join(overrides)
+        )
+    if shutil.which("git") is None:
+        fail("Required executable is unavailable: git")
+    if not CANONICAL_APP_REPO.is_dir():
+        fail(f"Implementation repository is missing: {CANONICAL_APP_REPO}")
+
+    probe = direct_git(invocation_directory, ["rev-parse", "--is-inside-work-tree"])
+    if probe.returncode != 0:
+        return CANONICAL_APP_REPO.resolve()
+    if probe.stdout.strip() != "true":
+        fail("The invocation directory is a Git repository but not a worktree")
+
+    candidate = Path(
+        direct_git_output(invocation_directory, ["rev-parse", "--show-toplevel"])
+    ).resolve()
+    canonical_common = common_git_directory(CANONICAL_APP_REPO)
+    candidate_common = common_git_directory(candidate)
+    if candidate_common != canonical_common:
+        fail(
+            "The invocation directory belongs to a different Git repository; "
+            "run the helper from the application repository or one of its registered "
+            "worktrees"
+        )
+    if candidate not in registered_worktrees():
+        fail(f"The application worktree is not registered: {candidate}")
+    return candidate
+
+
+def run(
+    args: list[str],
+    *,
+    check: bool = True,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        args,
+        cwd=APP_REPO,
+        check=False,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic output"
+        fail(f"Command failed ({' '.join(args[:3])}): {detail}")
+    return result
+
+
+def output(args: list[str]) -> str:
+    return run(args).stdout.strip()
+
+
+def json_output(args: list[str]) -> Any:
+    raw = output(args)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"Command returned invalid JSON ({' '.join(args[:3])}): {exc}")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def ensure_app_repo() -> None:
+    if not CANONICAL_APP_REPO.is_dir():
+        fail(f"Implementation repository is missing: {CANONICAL_APP_REPO}")
+    if not APP_REPO.is_dir():
+        fail(f"Active application worktree is missing: {APP_REPO}")
+    root = Path(output(["git", "rev-parse", "--show-toplevel"])).resolve()
+    if root != APP_REPO.resolve():
+        fail(f"Expected Git root {APP_REPO}, found {root}")
+    if common_git_directory(APP_REPO) != common_git_directory(CANONICAL_APP_REPO):
+        fail("Active worktree does not share the canonical application Git directory")
+    if root not in registered_worktrees():
+        fail(f"Active application worktree is not registered: {root}")
+
+
+def ensure_origin() -> None:
+    remotes = output(["git", "remote"]).splitlines()
+    if remotes != ["origin"]:
+        fail(f"Expected exactly one remote named origin; found {remotes or 'none'}")
+    fetch_urls = output(["git", "remote", "get-url", "--all", "origin"]).splitlines()
+    push_urls = output(
+        ["git", "remote", "get-url", "--push", "--all", "origin"]
+    ).splitlines()
+    if fetch_urls != [EXPECTED_ORIGIN] or push_urls != [EXPECTED_ORIGIN]:
+        fail(
+            "Remote mismatch. This helper will not create or change remotes; "
+            f"expected one fetch URL and one push URL, both {EXPECTED_ORIGIN}."
+        )
+    mirror = run(
+        ["git", "config", "--bool", "--get", "remote.origin.mirror"],
+        check=False,
+    )
+    if mirror.returncode == 0 and mirror.stdout.strip() != "false":
+        fail("remote.origin.mirror must be unset or false")
+    if mirror.returncode not in {0, 1}:
+        fail(mirror.stderr.strip() or "Unable to inspect remote.origin.mirror")
+    for key in (
+        "remote.origin.push",
+        "remote.origin.pushOption",
+        "push.pushOption",
+    ):
+        configured = run(["git", "config", "--get-all", key], check=False)
+        if configured.returncode == 0 and configured.stdout.strip():
+            fail(f"Custom {key} values are not allowed")
+        if configured.returncode not in {0, 1}:
+            fail(configured.stderr.strip() or f"Unable to inspect {key}")
+
+
+def ensure_private_repositories() -> None:
+    for slug in {APP_SLUG, TICKET_SLUG}:
+        data = json_output(
+            ["gh", "repo", "view", slug, "--json", "nameWithOwner,visibility,url"]
+        )
+        if data.get("nameWithOwner") != slug or data.get("visibility") != "PRIVATE":
+            fail(f"Expected authenticated access to private repository {slug}")
+
+
+def ensure_project_scope() -> None:
+    result = run(["gh", "auth", "status", "--hostname", "github.com"])
+    combined = f"{result.stdout}\n{result.stderr}"
+    scope_match = re.search(r"Token scopes:\s*(.+)", combined)
+    scopes = (
+        {scope.strip().lower() for scope in re.findall(r"'([^']+)'", scope_match.group(1))}
+        if scope_match
+        else set()
+    )
+    if "project" not in scopes:
+        fail(
+            "GitHub authentication lacks the project scope. Run "
+            "`gh auth refresh -h github.com -s project` interactively."
+        )
+
+
+def project_metadata() -> dict[str, Any]:
+    project = json_output(
+        [
+            "gh",
+            "project",
+            "view",
+            str(PROJECT_NUMBER),
+            "--owner",
+            PROJECT_OWNER,
+            "--format",
+            "json",
+        ]
+    )
+    fields_data = json_output(
+        [
+            "gh",
+            "project",
+            "field-list",
+            str(PROJECT_NUMBER),
+            "--owner",
+            PROJECT_OWNER,
+            "--format",
+            "json",
+        ]
+    )
+    fields = fields_data.get("fields", [])
+    status_fields = [
+        field
+        for field in fields
+        if field.get("name") == "Status"
+        and field.get("type") == "ProjectV2SingleSelectField"
+    ]
+    if len(status_fields) != 1:
+        fail(f"Expected exactly one single-select Status field; found {len(status_fields)}")
+    status_field = status_fields[0]
+    options: dict[str, str] = {}
+    for expected in sorted(ALLOWED_STATUSES):
+        matches = [
+            option
+            for option in status_field.get("options", [])
+            if option.get("name") == expected
+        ]
+        if len(matches) != 1:
+            fail(f"Expected exactly one Status option named {expected}; found {len(matches)}")
+        options[expected] = matches[0]["id"]
+    actual_names = {option.get("name") for option in status_field.get("options", [])}
+    if actual_names != ALLOWED_STATUSES:
+        fail(f"Unexpected Status options: {sorted(actual_names)}")
+    project_id = project.get("id")
+    if not project_id:
+        fail("GitHub Project has no node ID")
+    return {
+        "project_id": project_id,
+        "status_field_id": status_field["id"],
+        "status_options": options,
+        "url": project.get("url"),
+    }
+
+
+def issue_data(issue_number: int, *, require_open: bool = True) -> dict[str, Any]:
+    data = json_output(
+        [
+            "gh",
+            "issue",
+            "view",
+            str(issue_number),
+            "--repo",
+            TICKET_SLUG,
+            "--json",
+            "number,title,state,url,milestone,labels,body",
+        ]
+    )
+    if data.get("number") != issue_number:
+        fail(f"App issue #{issue_number} is missing")
+    if require_open and data.get("state") != "OPEN":
+        fail(f"App issue #{issue_number} is not open")
+    return data
+
+
+def all_project_items() -> list[dict[str, Any]]:
+    data = json_output(
+        [
+            "gh",
+            "project",
+            "item-list",
+            str(PROJECT_NUMBER),
+            "--owner",
+            PROJECT_OWNER,
+            "--format",
+            "json",
+            "--limit",
+            "200",
+        ]
+    )
+    items = data.get("items", [])
+    if data.get("totalCount") != len(items):
+        fail(
+            "The project item list was incomplete; refusing to infer a unique ticket item."
+        )
+    return items
+
+
+def project_item(issue_number: int) -> dict[str, Any]:
+    matches = []
+    for item in all_project_items():
+        content = item.get("content") or {}
+        repository = content.get("repository")
+        if (
+            content.get("number") == issue_number
+            and repository == TICKET_SLUG
+            and content.get("type") == "Issue"
+        ):
+            matches.append(item)
+    if len(matches) != 1:
+        fail(
+            f"Expected exactly one Project item for {TICKET_SLUG}#{issue_number}; "
+            f"found {len(matches)}"
+        )
+    item = matches[0]
+    if item.get("status") not in ALLOWED_STATUSES:
+        fail(f"Ticket has an unknown Project status: {item.get('status')!r}")
+    return item
+
+
+def validate_ticket_key(ticket: str) -> None:
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", ticket):
+        fail(f"Invalid ticket identifier: {ticket!r}")
+
+
+def validate_ticket(
+    issue_number: int,
+    ticket: str,
+    base: str,
+    *,
+    allowed_statuses: set[str],
+    require_open: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if base not in ALLOWED_BASES:
+        fail(f"Base must be one of: {', '.join(sorted(ALLOWED_BASES))}")
+    validate_ticket_key(ticket)
+    issue = issue_data(issue_number, require_open=require_open)
+    if f"[{ticket}]" not in issue.get("title", ""):
+        fail(
+            f"Issue #{issue_number} title does not contain the exact ticket key [{ticket}]"
+        )
+    item = project_item(issue_number)
+    if item.get("integration branch") != base:
+        fail(
+            f"Integration branch mismatch: Project says "
+            f"{item.get('integration branch')!r}, command says {base!r}"
+        )
+    if item.get("status") not in allowed_statuses:
+        fail(
+            f"Project status {item.get('status')!r} is not valid for this operation; "
+            f"expected one of {sorted(allowed_statuses)}"
+        )
+    return issue, item
+
+
+def current_branch() -> str:
+    branch = output(["git", "branch", "--show-current"])
+    if not branch:
+        fail("Detached HEAD is not allowed")
+    return branch
+
+
+def validate_branch(ticket: str) -> str:
+    branch = current_branch()
+    if not re.fullmatch(rf"{re.escape(ticket)}/[a-z0-9][a-z0-9-]*", branch):
+        fail(
+            f"Branch {branch!r} must match {ticket}/<lowercase-hyphenated-description>"
+        )
+    return branch
+
+
+def git_dir() -> Path:
+    raw = output(["git", "rev-parse", "--git-dir"])
+    return resolve_git_path(APP_REPO, raw)
+
+
+def common_git_dir() -> Path:
+    return common_git_directory(APP_REPO)
+
+
+def git_path(name: str) -> Path:
+    raw = output(["git", "rev-parse", "--git-path", name])
+    return resolve_git_path(APP_REPO, raw)
+
+
+def reject_in_progress_git_operation() -> None:
+    directory = git_dir()
+    markers = (
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "rebase-apply",
+        "rebase-merge",
+    )
+    present = [marker for marker in markers if (directory / marker).exists()]
+    if present:
+        fail(f"An in-progress Git operation is present: {', '.join(present)}")
+
+
+def reject_pre_staged_changes() -> None:
+    result = run(["git", "diff", "--cached", "--quiet"], check=False)
+    if result.returncode == 1:
+        fail("Pre-staged changes are not allowed; the helper stages only its attested manifest")
+    if result.returncode != 0:
+        fail(result.stderr.strip() or "Unable to inspect staged changes")
+
+
+def reject_active_git_hooks() -> None:
+    configured = run(
+        ["git", "config", "--path", "--get", "core.hooksPath"],
+        check=False,
+    )
+    if configured.returncode == 0:
+        fail(
+            "An active core.hooksPath is approval-gated; automatic publication "
+            "requires the default hook directory with no active hooks"
+        )
+    if configured.returncode != 1:
+        fail(configured.stderr.strip() or "Unable to inspect core.hooksPath")
+    hooks = git_path("hooks")
+    active = []
+    if hooks.is_dir():
+        active = sorted(
+            path.name
+            for path in hooks.iterdir()
+            if path.is_file()
+            and not path.name.endswith(".sample")
+            and os.access(path, os.X_OK)
+        )
+    if active:
+        fail(f"Active Git hooks are approval-gated: {', '.join(active)}")
+
+
+def parse_porcelain_z(raw: bytes) -> list[tuple[str, str]]:
+    parts = raw.split(b"\0")
+    entries: list[tuple[str, str]] = []
+    index = 0
+    while index < len(parts):
+        record = parts[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 4 or record[2:3] != b" ":
+            fail("Unable to parse Git status safely")
+        status_code = record[:2].decode("ascii", "strict")
+        path = os.fsdecode(record[3:])
+        if "R" in status_code or "C" in status_code:
+            if index >= len(parts) or not parts[index]:
+                fail("Unable to parse renamed or copied path from Git status")
+            index += 1
+        entries.append((status_code, path))
+    return entries
+
+
+def porcelain_entries() -> list[tuple[str, str]]:
+    result = subprocess.run(
+        [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+        cwd=APP_REPO,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        fail(os.fsdecode(result.stderr).strip() or "Unable to inspect Git status")
+    return parse_porcelain_z(result.stdout)
+
+
+def normalize_repo_path(raw: str) -> str:
+    if not raw or "\0" in raw or any(ord(character) < 32 for character in raw):
+        fail("Manifest paths must be non-empty and contain no control characters")
+    pure = PurePosixPath(raw)
+    if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+        fail(f"Manifest path must be a normalized repository-relative path: {raw!r}")
+    normalized = pure.as_posix()
+    candidate = APP_REPO / normalized
+    try:
+        candidate.relative_to(APP_REPO)
+    except ValueError:
+        fail(f"Path escapes the implementation repository: {raw!r}")
+    return normalized
+
+
+def reject_protected_path(path: str) -> None:
+    pure = PurePosixPath(path)
+    top = pure.parts[0]
+    name = pure.name
+    lower_name = name.lower()
+    if top in PROTECTED_TOP_LEVEL or path in PROTECTED_FILES:
+        fail(f"Local agent configuration is protected from publication: {path}")
+    if lower_name == ".env" or (
+        lower_name.startswith(".env.") and lower_name != ".env.example"
+    ):
+        fail(f"Environment files are protected from publication: {path}")
+    if lower_name.endswith((".pem", ".key", ".p12", ".pfx")):
+        fail(f"Credential-like files are protected from publication: {path}")
+
+
+def ensure_safe_symlink(path: str) -> None:
+    candidate = APP_REPO / path
+    if not candidate.is_symlink():
+        return
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(APP_REPO.resolve())
+    except ValueError:
+        fail(f"Symlink target escapes the implementation repository: {path}")
+
+
+def file_mode(path: Path) -> str:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        return "120000"
+    if info.st_mode & stat.S_IXUSR:
+        return "100755"
+    return "100644"
+
+
+def blob_hash(path: str) -> str:
+    return output(["git", "hash-object", "--no-filters", "--", path])
+
+
+def manifest_covers(path: str, roots: Iterable[str]) -> bool:
+    pure = PurePosixPath(path)
+    for root in roots:
+        root_pure = PurePosixPath(root)
+        if pure == root_pure or root_pure in pure.parents:
+            return True
+    return False
+
+
+def worktree_snapshot(allowed_roots: list[str] | None = None) -> list[dict[str, str]]:
+    entries = porcelain_entries()
+    snapshot: list[dict[str, str]] = []
+    for status_code, raw_path in entries:
+        path = normalize_repo_path(raw_path)
+        if any(character in status_code for character in "DRC"):
+            fail(f"Deletion, rename, or copy is approval-gated and cannot be published: {path}")
+        if "U" in status_code or status_code in {"AA", "DD"}:
+            fail(f"Unmerged path cannot be published: {path}")
+        reject_protected_path(path)
+        candidate = APP_REPO / path
+        if not candidate.exists() and not candidate.is_symlink():
+            fail(f"Dirty path does not exist and cannot be safely hashed: {path}")
+        ensure_safe_symlink(path)
+        if allowed_roots is not None and not manifest_covers(path, allowed_roots):
+            fail(f"Dirty path is outside the declared manifest: {path}")
+        snapshot.append(
+            {
+                "path": path,
+                "status": status_code,
+                "blob": blob_hash(path),
+                "mode": file_mode(candidate),
+            }
+        )
+    return sorted(snapshot, key=lambda entry: entry["path"])
+
+
+def snapshot_digest(snapshot: list[dict[str, str]]) -> str:
+    canonical = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def state_directory() -> Path:
+    directory = common_git_dir() / "photography-ticket-delivery"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return directory
+
+
+def state_path(ticket: str) -> Path:
+    validate_ticket_key(ticket)
+    return common_git_dir() / "photography-ticket-delivery" / f"{ticket}.json"
+
+
+def load_state(ticket: str) -> dict[str, Any]:
+    path = state_path(ticket)
+    if not path.is_file():
+        fail(f"No local delivery attestation exists for {ticket}")
+    try:
+        state_data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"Cannot read delivery attestation for {ticket}: {exc}")
+    if state_data.get("schema") != STATE_SCHEMA:
+        fail(f"Unsupported delivery attestation schema for {ticket}")
+    return state_data
+
+
+def save_state(ticket: str, state_data: dict[str, Any]) -> None:
+    directory = state_directory()
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{ticket}.", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(state_data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, state_path(ticket))
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+@contextmanager
+def delivery_lock() -> Iterable[None]:
+    lock_path = state_directory() / "delivery.lock"
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def validate_evidence_path(raw: str) -> str:
+    path = normalize_repo_path(raw)
+    reject_protected_path(path)
+    candidate = APP_REPO / path
+    if not candidate.is_file() or candidate.is_symlink():
+        fail(f"Evidence must be a regular file inside the repository: {path}")
+    return path
+
+
+def command_doctor(_: argparse.Namespace) -> None:
+    ensure_app_repo()
+    ensure_origin()
+    for executable in ("git", "gh"):
+        if shutil.which(executable) is None:
+            fail(f"Required executable is unavailable: {executable}")
+    ensure_project_scope()
+    ensure_private_repositories()
+    metadata = project_metadata()
+    print("Ticket delivery doctor: PASS")
+    print(f"Implementation repository: {CANONICAL_APP_REPO}")
+    print(f"Active registered worktree: {APP_REPO}")
+    print(f"Shared Git directory: {common_git_dir()}")
+    print(f"Origin: {EXPECTED_ORIGIN}")
+    print(f"Ticket repository: {TICKET_SLUG} (private, app repository only)")
+    print(f"GitHub Project: {metadata.get('url')}")
+    print(
+        "Automatic after two acceptance gates: commit, non-force push, draft PR, "
+        "evidence comment, In Review"
+    )
+    print("Approval-gated through complete: merged evidence, issue closure, Done")
+    print("Never performed: merge, force-push, remote changes, branch/file deletion")
+
+
+def prs_for_branch(branch: str) -> list[dict[str, Any]]:
+    return json_output(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            APP_SLUG,
+            "--state",
+            "all",
+            "--head",
+            branch,
+            "--json",
+            (
+                "number,title,state,isDraft,url,baseRefName,headRefName,"
+                "headRefOid,mergedAt,closedAt"
+            ),
+        ]
+    )
+
+
+def command_status(args: argparse.Namespace) -> None:
+    ensure_app_repo()
+    ensure_origin()
+    issue = issue_data(args.issue)
+    item = project_item(args.issue)
+    branch = current_branch()
+    prs = prs_for_branch(branch)
+    ticket_match = re.match(r"^\[([A-Z][A-Z0-9]*-\d+)\]", issue["title"])
+    ticket = ticket_match.group(1) if ticket_match else None
+    branch_matches_ticket = bool(
+        ticket
+        and re.fullmatch(
+            rf"{re.escape(ticket)}/[a-z0-9][a-z0-9-]*",
+            branch,
+        )
+    )
+    remote_sha = remote_branch_sha(branch)
+    attestation: dict[str, Any] | None = None
+    if ticket and state_path(ticket).is_file():
+        local_state = load_state(ticket)
+        attestation = {
+            "phase": local_state.get("phase"),
+            "publication_commit": local_state.get("publication_commit"),
+            "evidence": local_state.get("evidence"),
+            "pull_request_url": local_state.get("pull_request_url"),
+            "comment_url": local_state.get("comment_url"),
+        }
+        publication_commit = local_state.get("publication_commit")
+        evidence = local_state.get("evidence")
+        if publication_commit and evidence:
+            attestation["immutable_evidence_url"] = immutable_evidence_url(
+                publication_commit, evidence
+            )
+    head = output(["git", "rev-parse", "HEAD"])
+    print(
+        json.dumps(
+            {
+                "issue": {
+                    "number": issue["number"],
+                    "title": issue["title"],
+                    "state": issue["state"],
+                    "url": issue["url"],
+                },
+                "project": {
+                    "status": item.get("status"),
+                    "integration_branch": item.get("integration branch"),
+                    "item_id": item.get("id"),
+                },
+                "local": {
+                    "branch": branch,
+                    "branch_matches_ticket": branch_matches_ticket,
+                    "head": head,
+                    "dirty_paths": [entry[1] for entry in porcelain_entries()],
+                },
+                "remote": {
+                    "branch_sha": remote_sha,
+                    "matches_local_head": remote_sha == head,
+                },
+                "attestation": attestation,
+                "pull_requests": prs,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def default_commit_message(ticket: str, issue_title: str) -> str:
+    title = re.sub(rf"^\[{re.escape(ticket)}\]\s*", "", issue_title).strip()
+    return f"{ticket.lower()}: {title[:64]}"
+
+
+def command_attest(args: argparse.Namespace) -> None:
+    with delivery_lock():
+        ensure_app_repo()
+        ensure_origin()
+        reject_in_progress_git_operation()
+        reject_pre_staged_changes()
+        if args.gate != "READY_TO_PUBLISH":
+            fail("Attestation requires the exact local gate verdict READY_TO_PUBLISH")
+        issue, item = validate_ticket(
+            args.issue,
+            args.ticket,
+            args.base,
+            allowed_statuses={"Todo", "In Progress"},
+        )
+        branch = validate_branch(args.ticket)
+        evidence = validate_evidence_path(args.evidence)
+        roots = sorted({normalize_repo_path(path) for path in args.path})
+        for root in roots:
+            reject_protected_path(root)
+        snapshot = worktree_snapshot(roots)
+        if snapshot and not roots:
+            fail("Dirty work requires at least one explicit --path manifest root")
+        if snapshot and not manifest_covers(evidence, roots):
+            fail("A dirty evidence file must be covered by an explicit --path")
+        existing_path = state_path(args.ticket)
+        if existing_path.exists():
+            existing = load_state(args.ticket)
+            if existing.get("phase") in {
+                "COMMITTED_AWAITING_PUBLICATION",
+                "PUBLISHED_AWAITING_FINAL_GATE",
+                "IN_REVIEW",
+            }:
+                fail(
+                    f"{args.ticket} already has a {existing.get('phase')} attestation; "
+                    "do not replace published evidence"
+                )
+        head = output(["git", "rev-parse", "HEAD"])
+        base_commit = fetch_base(args.base)
+        if not is_ancestor(base_commit, head):
+            fail(
+                f"origin/{args.base} is not an ancestor of HEAD; "
+                "rebase or merge requires separate approval"
+            )
+        remote_head = remote_branch_sha(branch)
+        if snapshot:
+            expected_head = remote_head if remote_head else base_commit
+            if head != expected_head:
+                fail(
+                    "Dirty-ticket attestation requires HEAD to equal the current "
+                    "remote ticket branch, or origin/base when the branch is new. "
+                    "Pre-existing unpublished commits are not accepted."
+                )
+        elif remote_head != head:
+            fail(
+                "A clean adoption requires the remote ticket branch to equal HEAD; "
+                "the helper will not publish pre-existing local commits."
+            )
+        commit_message = (
+            args.commit_message
+            or default_commit_message(args.ticket, issue["title"])
+        ).strip()
+        if not commit_message:
+            fail("Commit message must not be empty")
+        title = (args.title or issue["title"]).strip()
+        if not title or "\n" in title or "\r" in title:
+            fail("Pull-request title must be one non-empty line")
+        if re.search(
+            (
+                r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+"
+                r"(?:#\d+|[\w.-]+/[\w.-]+#\d+|https://github\.com/\S+/issues/\d+)"
+            ),
+            commit_message,
+            re.IGNORECASE,
+        ):
+            fail("Commit messages may not contain issue-closing keywords")
+        state_data = {
+            "schema": STATE_SCHEMA,
+            "phase": "READY_TO_PUBLISH",
+            "created_at": utc_now(),
+            "issue": args.issue,
+            "issue_url": issue["url"],
+            "ticket": args.ticket,
+            "base": args.base,
+            "branch": branch,
+            "project_item_id": item["id"],
+            "project_status": item["status"],
+            "evidence": evidence,
+            "title": title,
+            "commit_message": commit_message,
+            "original_head": head,
+            "base_commit_at_attest": base_commit,
+            "remote_branch_at_attest": remote_head,
+            "paths": roots,
+            "snapshot": snapshot,
+            "snapshot_sha256": snapshot_digest(snapshot),
+        }
+        save_state(args.ticket, state_data)
+        print(f"READY_TO_PUBLISH attested for {args.ticket}")
+        print(f"Branch: {branch}")
+        print(f"HEAD: {head}")
+        print(f"Dirty manifest files: {len(snapshot)}")
+        print(f"Evidence: {evidence}")
+
+
+def verify_state_identity(
+    state_data: dict[str, Any],
+    args: argparse.Namespace,
+    expected_phase: str | set[str],
+) -> None:
+    expected = {
+        "issue": args.issue,
+        "ticket": args.ticket,
+        "base": args.base,
+    }
+    for key, value in expected.items():
+        if state_data.get(key) != value:
+            fail(
+                f"Attestation {key} mismatch: stored {state_data.get(key)!r}, "
+                f"command {value!r}"
+            )
+    phases = {expected_phase} if isinstance(expected_phase, str) else expected_phase
+    if state_data.get("phase") not in phases:
+        fail(
+            f"Attestation phase is {state_data.get('phase')!r}; "
+            f"expected one of {sorted(phases)!r}"
+        )
+
+
+def require_clean_worktree() -> None:
+    if porcelain_entries():
+        fail("The worktree must be clean for this operation")
+    reject_pre_staged_changes()
+
+
+def fetch_base(base: str) -> str:
+    run(
+        [
+            "git",
+            "fetch",
+            "--no-tags",
+            "origin",
+            f"refs/heads/{base}:refs/remotes/origin/{base}",
+        ]
+    )
+    return output(["git", "rev-parse", f"refs/remotes/origin/{base}"])
+
+
+def is_ancestor(ancestor: str, descendant: str) -> bool:
+    result = run(["git", "merge-base", "--is-ancestor", ancestor, descendant], check=False)
+    if result.returncode not in {0, 1}:
+        fail(result.stderr.strip() or "Unable to verify Git ancestry")
+    return result.returncode == 0
+
+
+def remote_branch_sha(branch: str) -> str | None:
+    result = output(
+        ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"]
+    )
+    if not result:
+        return None
+    lines = result.splitlines()
+    if len(lines) != 1:
+        fail(f"Expected at most one remote ref for {branch}")
+    fields = lines[0].split()
+    if len(fields) != 2 or fields[1] != f"refs/heads/{branch}":
+        fail(f"Unexpected remote ref response for {branch}")
+    return fields[0]
+
+
+def stage_and_commit(state_data: dict[str, Any]) -> str:
+    snapshot = state_data["snapshot"]
+    if not snapshot:
+        require_clean_worktree()
+        return output(["git", "rev-parse", "HEAD"])
+    paths = [entry["path"] for entry in snapshot]
+    run(["git", "add", "-A", "--", *paths])
+    unstaged = run(["git", "diff", "--quiet"], check=False)
+    if unstaged.returncode == 1:
+        fail("Unstaged changes remain after staging the exact attested manifest")
+    if unstaged.returncode != 0:
+        fail(unstaged.stderr.strip() or "Unable to inspect unstaged changes")
+    untracked = output(["git", "ls-files", "--others", "--exclude-standard", "-z"])
+    if untracked:
+        fail("Untracked files remain after staging the exact attested manifest")
+    cached_raw = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "-z"],
+        cwd=APP_REPO,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if cached_raw.returncode != 0:
+        fail(os.fsdecode(cached_raw.stderr).strip() or "Unable to inspect staged paths")
+    cached_paths = sorted(
+        os.fsdecode(part) for part in cached_raw.stdout.split(b"\0") if part
+    )
+    if cached_paths != sorted(paths):
+        fail(
+            "Staged paths differ from the attested manifest: "
+            f"expected {sorted(paths)}, found {cached_paths}"
+        )
+    check = run(["git", "diff", "--cached", "--check"], check=False)
+    if check.returncode != 0:
+        fail(check.stdout.strip() or check.stderr.strip() or "git diff --check failed")
+    original_head = state_data["original_head"]
+    if output(["git", "rev-parse", "HEAD"]) != original_head:
+        fail("HEAD changed after attestation")
+    run(["git", "commit", "-m", state_data["commit_message"]])
+    commit = output(["git", "rev-parse", "HEAD"])
+    parents = output(["git", "show", "-s", "--format=%P", commit]).split()
+    if parents != [original_head]:
+        fail("Publication commit is not a single direct child of the attested HEAD")
+    verify_commit_manifest(commit, snapshot)
+    require_clean_worktree()
+    return commit
+
+
+def verify_commit_manifest(commit: str, snapshot: list[dict[str, str]]) -> None:
+    changed = subprocess.run(
+        [
+            "git",
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            commit,
+        ],
+        cwd=APP_REPO,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if changed.returncode != 0:
+        fail(os.fsdecode(changed.stderr).strip() or "Unable to inspect commit manifest")
+    changed_paths = sorted(
+        os.fsdecode(part) for part in changed.stdout.split(b"\0") if part
+    )
+    expected_paths = sorted(entry["path"] for entry in snapshot)
+    if changed_paths != expected_paths:
+        fail(
+            "Committed paths differ from the attested manifest: "
+            f"expected {expected_paths}, found {changed_paths}"
+        )
+    for entry in snapshot:
+        tree = subprocess.run(
+            ["git", "ls-tree", "-z", commit, "--", entry["path"]],
+            cwd=APP_REPO,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if tree.returncode != 0 or not tree.stdout.endswith(b"\0"):
+            fail(f"Unable to inspect committed blob for {entry['path']}")
+        records = [record for record in tree.stdout.split(b"\0") if record]
+        if len(records) != 1 or b"\t" not in records[0]:
+            fail(f"Unexpected committed tree entry for {entry['path']}")
+        metadata, raw_path = records[0].split(b"\t", 1)
+        fields = metadata.decode("ascii", "strict").split()
+        if (
+            len(fields) != 3
+            or fields[1] != "blob"
+            or fields[0] != entry["mode"]
+            or fields[2] != entry["blob"]
+            or os.fsdecode(raw_path) != entry["path"]
+        ):
+            fail(f"Committed blob or mode differs from the attestation: {entry['path']}")
+
+
+def ensure_evidence_in_commit(commit: str, evidence: str) -> None:
+    result = run(["git", "cat-file", "-e", f"{commit}:{evidence}"], check=False)
+    if result.returncode != 0:
+        fail(f"Evidence is not tracked in publication commit {commit}: {evidence}")
+
+
+def push_branch(branch: str, commit: str) -> None:
+    ensure_origin()
+    remote_sha = remote_branch_sha(branch)
+    if remote_sha:
+        if not is_ancestor(remote_sha, commit):
+            fail(
+                f"Remote branch {branch} is not an ancestor of local HEAD; "
+                "force-push is forbidden"
+            )
+        if remote_sha == commit:
+            return
+    run(
+        [
+            "git",
+            "push",
+            "--no-follow-tags",
+            "--recurse-submodules=no",
+            "--set-upstream",
+            "origin",
+            f"HEAD:refs/heads/{branch}",
+        ]
+    )
+    confirmed = remote_branch_sha(branch)
+    if confirmed != commit:
+        fail(f"Remote branch verification failed: expected {commit}, found {confirmed}")
+
+
+def pull_request_body(state_data: dict[str, Any], commit: str) -> str:
+    evidence_url = immutable_evidence_url(commit, state_data["evidence"])
+    return "\n".join(
+        [
+            f"App issue: {state_data['issue_url']}",
+            "",
+            "## Acceptance evidence",
+            "",
+            f"- Evidence manifest: {evidence_url}",
+            f"- Publication commit: {immutable_commit_url(commit)}",
+            "",
+            "This pull request is intentionally a draft. Merge and issue closure require "
+            "explicit user approval.",
+        ]
+    )
+
+
+def select_existing_draft_pr(
+    branch: str, base: str, commit: str
+) -> dict[str, Any] | None:
+    prs = prs_for_branch(branch)
+    if len(prs) > 1:
+        fail(f"Multiple pull requests exist for {branch}; refusing ambiguous publication")
+    if not prs:
+        return None
+    pr = prs[0]
+    if pr.get("state") != "OPEN" or pr.get("mergedAt") or pr.get("closedAt"):
+        fail(f"Pull request #{pr.get('number')} is closed or merged; it will not be reused")
+    if pr.get("baseRefName") != base or pr.get("headRefName") != branch:
+        fail(f"Pull request #{pr.get('number')} has the wrong base or head branch")
+    if not pr.get("isDraft"):
+        fail(
+            f"Pull request #{pr.get('number')} is not a draft; "
+            "automatic delivery will not alter review readiness"
+        )
+    if pr.get("headRefOid") != commit:
+        fail(
+            f"Pull request #{pr.get('number')} does not point to publication commit {commit}"
+        )
+    return pr
+
+
+def create_or_reuse_draft_pr(state_data: dict[str, Any], commit: str) -> dict[str, Any]:
+    existing = select_existing_draft_pr(
+        state_data["branch"], state_data["base"], commit
+    )
+    if existing:
+        return existing
+    result = run(
+        [
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            APP_SLUG,
+            "--base",
+            state_data["base"],
+            "--head",
+            state_data["branch"],
+            "--title",
+            state_data["title"],
+            "--body",
+            pull_request_body(state_data, commit),
+            "--draft",
+            "--no-maintainer-edit",
+        ]
+    )
+    pr_url = result.stdout.strip().splitlines()[-1]
+    pr = json_output(
+        [
+            "gh",
+            "pr",
+            "view",
+            pr_url,
+            "--repo",
+            APP_SLUG,
+            "--json",
+            (
+                "number,title,state,isDraft,url,baseRefName,headRefName,"
+                "headRefOid,mergedAt,closedAt"
+            ),
+        ]
+    )
+    if (
+        pr.get("state") != "OPEN"
+        or not pr.get("isDraft")
+        or pr.get("baseRefName") != state_data["base"]
+        or pr.get("headRefName") != state_data["branch"]
+        or pr.get("headRefOid") != commit
+    ):
+        fail("Created pull request failed draft/base/head/commit verification")
+    return pr
+
+
+def immutable_commit_url(commit: str) -> str:
+    return f"https://github.com/{APP_SLUG}/commit/{commit}"
+
+
+def immutable_evidence_url(commit: str, evidence: str) -> str:
+    return f"https://github.com/{APP_SLUG}/blob/{commit}/{quote(evidence, safe='/')}"
+
+
+def list_issue_comments(issue_number: int) -> list[dict[str, Any]]:
+    comments: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        batch = json_output(
+            [
+                "gh",
+                "api",
+                f"repos/{TICKET_SLUG}/issues/{issue_number}/comments"
+                f"?per_page=100&page={page}",
+            ]
+        )
+        if not isinstance(batch, list):
+            fail("Issue comments endpoint returned an unexpected response")
+        comments.extend(batch)
+        if len(batch) < 100:
+            return comments
+        page += 1
+
+
+def evidence_marker(issue_number: int) -> str:
+    return (
+        f"<!-- photography-ticket-delivery:{TICKET_SLUG}#{issue_number} -->"
+    )
+
+
+def evidence_end_marker(issue_number: int) -> str:
+    return (
+        f"<!-- /photography-ticket-delivery:{TICKET_SLUG}#{issue_number} -->"
+    )
+
+
+def evidence_comment_body(
+    state_data: dict[str, Any], commit: str, pr: dict[str, Any]
+) -> str:
+    return "\n".join(
+        [
+            evidence_marker(state_data["issue"]),
+            f"## {state_data['ticket']} acceptance evidence",
+            "",
+            f"- Draft pull request: {pr['url']}",
+            f"- Publication commit: {immutable_commit_url(commit)}",
+            f"- Evidence manifest: {immutable_evidence_url(commit, state_data['evidence'])}",
+            "",
+            "All substantive local acceptance checks passed for this exact commit. "
+            "The draft PR is ready for review.",
+            "",
+            "The issue remains open. Merge, issue closure, Done status, force-push, "
+            "remote changes, and deletion were not performed.",
+            evidence_end_marker(state_data["issue"]),
+        ]
+    )
+
+
+def create_or_update_evidence_comment(
+    state_data: dict[str, Any], commit: str, pr: dict[str, Any]
+) -> dict[str, Any]:
+    comments = list_issue_comments(state_data["issue"])
+    marker = evidence_marker(state_data["issue"])
+    marked = [comment for comment in comments if marker in (comment.get("body") or "")]
+    if len(marked) > 1:
+        fail("Multiple delivery evidence comments use the stable marker")
+    target = marked[0] if marked else None
+    if target is None:
+        legacy = [
+            comment
+            for comment in comments
+            if pr["url"] in (comment.get("body") or "")
+            and commit in (comment.get("body") or "")
+        ]
+        if len(legacy) > 1:
+            fail("Multiple legacy evidence comments match this pull request and commit")
+        target = legacy[0] if legacy else None
+    body = evidence_comment_body(state_data, commit, pr)
+    updated_body = body
+    if target is None:
+        target = json_output(
+            [
+                "gh",
+                "api",
+                "-X",
+                "POST",
+                f"repos/{TICKET_SLUG}/issues/{state_data['issue']}/comments",
+                "-f",
+                f"body={body}",
+            ]
+        )
+    else:
+        existing_body = target.get("body") or ""
+        end_marker = evidence_end_marker(state_data["issue"])
+        if marker in existing_body:
+            if existing_body.count(marker) != 1 or existing_body.count(end_marker) > 1:
+                fail("Evidence comment has ambiguous managed-section delimiters")
+            if end_marker in existing_body:
+                start_index = existing_body.index(marker)
+                end_index = existing_body.index(end_marker) + len(end_marker)
+                updated_body = (
+                    existing_body[:start_index] + body + existing_body[end_index:]
+                )
+            elif (
+                existing_body.startswith(marker)
+                and pr["url"] in existing_body
+                and commit in existing_body
+            ):
+                # Migrate an earlier helper-owned whole-comment format.
+                updated_body = body
+            else:
+                fail("Evidence comment has an unterminated managed section")
+        else:
+            prefix = existing_body.rstrip()
+            updated_body = f"{prefix}\n\n{body}" if prefix else body
+        if existing_body != updated_body:
+            target = json_output(
+                [
+                    "gh",
+                    "api",
+                    "-X",
+                    "PATCH",
+                    f"repos/{TICKET_SLUG}/issues/comments/{target['id']}",
+                    "-f",
+                    f"body={updated_body}",
+                ]
+            )
+    confirmed = json_output(
+        [
+            "gh",
+            "api",
+            f"repos/{TICKET_SLUG}/issues/comments/{target['id']}",
+        ]
+    )
+    if confirmed.get("body") != updated_body or confirmed.get(
+        "html_url"
+    ) != target.get("html_url"):
+        fail("Evidence comment verification failed")
+    return confirmed
+
+
+def command_publish(args: argparse.Namespace) -> None:
+    with delivery_lock():
+        ensure_app_repo()
+        ensure_origin()
+        reject_in_progress_git_operation()
+        reject_pre_staged_changes()
+        reject_active_git_hooks()
+        state_data = load_state(args.ticket)
+        if state_data.get("phase") in {
+            "PUBLISHED_AWAITING_FINAL_GATE",
+            "IN_REVIEW",
+        }:
+            verify_state_identity(
+                state_data,
+                args,
+                {"PUBLISHED_AWAITING_FINAL_GATE", "IN_REVIEW"},
+            )
+            validate_ticket(
+                args.issue,
+                args.ticket,
+                args.base,
+                allowed_statuses={"Todo", "In Progress", "In Review"},
+            )
+            if validate_branch(args.ticket) != state_data["branch"]:
+                fail("Current branch differs from the published branch")
+            commit = state_data["publication_commit"]
+            if output(["git", "rev-parse", "HEAD"]) != commit:
+                fail("Local HEAD differs from the published commit")
+            require_clean_worktree()
+            if remote_branch_sha(state_data["branch"]) != commit:
+                fail("Remote branch differs from the published commit")
+            pr = exact_pull_request(state_data, commit)
+            comment = create_or_update_evidence_comment(state_data, commit, pr)
+            state_data.update(
+                {
+                    "comment_id": comment["id"],
+                    "comment_url": comment["html_url"],
+                }
+            )
+            save_state(args.ticket, state_data)
+            exact_evidence_comment(state_data, commit)
+            print(f"{state_data['phase']} for {args.ticket} (already published)")
+            print(f"Commit: {commit}")
+            print(f"Draft PR: {state_data['pull_request_url']}")
+            return
+        verify_state_identity(
+            state_data,
+            args,
+            {"READY_TO_PUBLISH", "COMMITTED_AWAITING_PUBLICATION"},
+        )
+        issue, item = validate_ticket(
+            args.issue,
+            args.ticket,
+            args.base,
+            allowed_statuses={"Todo", "In Progress"},
+        )
+        branch = validate_branch(args.ticket)
+        if branch != state_data["branch"]:
+            fail("Current branch differs from the attested branch")
+        base_commit = fetch_base(args.base)
+        if base_commit != state_data.get("base_commit_at_attest"):
+            fail(
+                f"origin/{args.base} changed after attestation; "
+                "a new acceptance decision is required"
+            )
+        if not is_ancestor(base_commit, state_data["original_head"]):
+            fail(
+                f"origin/{args.base} is not an ancestor of the attested HEAD; "
+                "rebase or merge requires separate approval"
+            )
+        remote_now = remote_branch_sha(branch)
+        phase = state_data["phase"]
+        if phase == "READY_TO_PUBLISH":
+            head_now = output(["git", "rev-parse", "HEAD"])
+            if head_now == state_data["original_head"]:
+                if remote_now != state_data.get("remote_branch_at_attest"):
+                    fail("The remote ticket branch changed after attestation")
+                current_snapshot = worktree_snapshot(state_data["paths"])
+                if current_snapshot != state_data["snapshot"]:
+                    fail("The worktree no longer matches the exact attested snapshot")
+                if snapshot_digest(current_snapshot) != state_data["snapshot_sha256"]:
+                    fail("The attested snapshot digest does not match")
+                commit = stage_and_commit(state_data)
+            else:
+                if not state_data["snapshot"]:
+                    fail("Clean adoption cannot recover an unexpected local commit")
+                require_clean_worktree()
+                parents = output(
+                    ["git", "show", "-s", "--format=%P", head_now]
+                ).split()
+                if parents != [state_data["original_head"]]:
+                    fail("Recovery HEAD is not the direct child of the attested HEAD")
+                message = output(["git", "show", "-s", "--format=%B", head_now])
+                if message != state_data["commit_message"]:
+                    fail("Recovery commit message differs from the attestation")
+                verify_commit_manifest(head_now, state_data["snapshot"])
+                if remote_now not in {
+                    state_data.get("remote_branch_at_attest"),
+                    head_now,
+                }:
+                    fail("The remote ticket branch changed during commit recovery")
+                commit = head_now
+            ensure_evidence_in_commit(commit, state_data["evidence"])
+            state_data.update(
+                {
+                    "phase": "COMMITTED_AWAITING_PUBLICATION",
+                    "committed_at": utc_now(),
+                    "publication_commit": commit,
+                }
+            )
+            save_state(args.ticket, state_data)
+        else:
+            commit = state_data.get("publication_commit")
+            if not commit or output(["git", "rev-parse", "HEAD"]) != commit:
+                fail("Local HEAD differs from the resumable publication commit")
+            require_clean_worktree()
+            if state_data["snapshot"]:
+                parents = output(["git", "show", "-s", "--format=%P", commit]).split()
+                if parents != [state_data["original_head"]]:
+                    fail("Resumable publication commit has unexpected parentage")
+                verify_commit_manifest(commit, state_data["snapshot"])
+            elif commit != state_data["original_head"]:
+                fail("Clean adoption unexpectedly created a commit")
+            ensure_evidence_in_commit(commit, state_data["evidence"])
+            if remote_now not in {
+                state_data.get("remote_branch_at_attest"),
+                commit,
+            }:
+                fail("The remote ticket branch changed during publication")
+        base_commit = fetch_base(args.base)
+        if base_commit != state_data.get("base_commit_at_attest"):
+            fail(
+                f"origin/{args.base} changed during publication; "
+                "the helper will not merge or rebase automatically"
+            )
+        if not is_ancestor(base_commit, commit):
+            fail(f"origin/{args.base} is not an ancestor of publication commit {commit}")
+        push_branch(branch, commit)
+        pr = create_or_reuse_draft_pr(state_data, commit)
+        comment = create_or_update_evidence_comment(state_data, commit, pr)
+        state_data.update(
+            {
+                "phase": "PUBLISHED_AWAITING_FINAL_GATE",
+                "published_at": utc_now(),
+                "publication_commit": commit,
+                "pull_request_number": pr["number"],
+                "pull_request_url": pr["url"],
+                "comment_id": comment["id"],
+                "comment_url": comment["html_url"],
+                "issue_url": issue["url"],
+                "project_status": item["status"],
+            }
+        )
+        save_state(args.ticket, state_data)
+        print(f"PUBLISHED_AWAITING_FINAL_GATE for {args.ticket}")
+        print(f"Commit: {commit}")
+        print(f"Draft PR: {pr['url']}")
+        print(f"Evidence comment: {comment['html_url']}")
+        print("Project status was not changed; rerun acceptance for this exact commit.")
+
+
+def exact_pull_request(state_data: dict[str, Any], commit: str) -> dict[str, Any]:
+    prs = prs_for_branch(state_data["branch"])
+    matches = [
+        pr for pr in prs if pr.get("number") == state_data["pull_request_number"]
+    ]
+    if len(matches) != 1 or len(prs) != 1:
+        fail("The published draft pull request is missing or ambiguous")
+    pr = matches[0]
+    if (
+        pr.get("state") != "OPEN"
+        or not pr.get("isDraft")
+        or pr.get("mergedAt")
+        or pr.get("closedAt")
+        or pr.get("baseRefName") != state_data["base"]
+        or pr.get("headRefName") != state_data["branch"]
+        or pr.get("headRefOid") != commit
+        or pr.get("url") != state_data["pull_request_url"]
+    ):
+        fail("Published pull request no longer matches the attested draft/base/head/commit")
+    return pr
+
+
+def exact_evidence_comment(state_data: dict[str, Any], commit: str) -> dict[str, Any]:
+    comment = json_output(
+        [
+            "gh",
+            "api",
+            f"repos/{TICKET_SLUG}/issues/comments/{state_data['comment_id']}",
+        ]
+    )
+    body = comment.get("body") or ""
+    marker = evidence_marker(state_data["issue"])
+    end_marker = evidence_end_marker(state_data["issue"])
+    required = (
+        marker,
+        end_marker,
+        state_data["pull_request_url"],
+        immutable_commit_url(commit),
+        immutable_evidence_url(commit, state_data["evidence"]),
+    )
+    if not all(value in body for value in required):
+        fail("Published acceptance-evidence comment no longer matches the attestation")
+    if body.count(marker) != 1 or body.count(end_marker) != 1:
+        fail("Published acceptance-evidence comment has ambiguous managed delimiters")
+    start_index = body.index(marker)
+    end_index = body.index(end_marker) + len(end_marker)
+    managed = body[start_index:end_index]
+    expected = evidence_comment_body(
+        state_data,
+        commit,
+        {"url": state_data["pull_request_url"]},
+    )
+    if managed != expected:
+        fail("The managed acceptance-evidence section was modified")
+    return comment
+
+
+def command_mark_review(args: argparse.Namespace) -> None:
+    with delivery_lock():
+        ensure_app_repo()
+        ensure_origin()
+        reject_in_progress_git_operation()
+        if args.verdict != "PASS":
+            fail("Only the exact final acceptance verdict PASS can move a ticket to In Review")
+        if not re.fullmatch(r"[0-9a-f]{40}", args.commit):
+            fail("--commit must be a full 40-character Git SHA")
+        state_data = load_state(args.ticket)
+        verify_state_identity(
+            state_data,
+            args,
+            {"PUBLISHED_AWAITING_FINAL_GATE", "IN_REVIEW"},
+        )
+        if state_data.get("publication_commit") != args.commit:
+            fail("Final gate commit differs from the published attestation")
+        validate_ticket(
+            args.issue,
+            args.ticket,
+            args.base,
+            allowed_statuses={"Todo", "In Progress", "In Review"},
+        )
+        if validate_branch(args.ticket) != state_data["branch"]:
+            fail("Current branch differs from the published branch")
+        if output(["git", "rev-parse", "HEAD"]) != args.commit:
+            fail("Local HEAD differs from the exact final gate commit")
+        require_clean_worktree()
+        remote_sha = remote_branch_sha(state_data["branch"])
+        if remote_sha != args.commit:
+            fail("Remote branch differs from the exact final gate commit")
+        exact_pull_request(state_data, args.commit)
+        exact_evidence_comment(state_data, args.commit)
+        item = project_item(args.issue)
+        status_name = item["status"]
+        if status_name == "Done":
+            fail("Done is approval-gated and cannot be changed by this helper")
+        if status_name not in {"Todo", "In Progress", "In Review"}:
+            fail(f"Unexpected project status: {status_name!r}")
+        if state_data["phase"] == "IN_REVIEW" and status_name != "In Review":
+            fail("Local attestation says IN_REVIEW but the live Project status differs")
+        if status_name != "In Review":
+            metadata = project_metadata()
+            run(
+                [
+                    "gh",
+                    "project",
+                    "item-edit",
+                    "--id",
+                    item["id"],
+                    "--project-id",
+                    metadata["project_id"],
+                    "--field-id",
+                    metadata["status_field_id"],
+                    "--single-select-option-id",
+                    metadata["status_options"]["In Review"],
+                ]
+            )
+        confirmed = project_item(args.issue)
+        if confirmed.get("status") != "In Review":
+            fail(
+                f"Project status verification failed: expected In Review, "
+                f"found {confirmed.get('status')!r}"
+            )
+        state_data.update(
+            {
+                "phase": "IN_REVIEW",
+                "in_review_at": utc_now(),
+                "project_status": "In Review",
+            }
+        )
+        save_state(args.ticket, state_data)
+        print(f"{args.ticket}: IN_REVIEW")
+        print(f"Commit: {args.commit}")
+        print(f"Draft PR: {state_data['pull_request_url']}")
+        print("Issue remains open; merge and closure remain approval-gated.")
+
+
+POST_MERGE_APPROVAL = "APPROVE_CLOSE_AND_MARK_DONE"
+
+
+def exact_merged_pull_request(
+    state_data: dict[str, Any], commit: str, pull_request_number: int
+) -> dict[str, Any]:
+    if pull_request_number != state_data.get("pull_request_number"):
+        fail("Pull request number differs from the delivery attestation")
+    pr = json_output(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(pull_request_number),
+            "--repo",
+            APP_SLUG,
+            "--json",
+            (
+                "number,title,state,isDraft,url,baseRefName,headRefName,"
+                "headRefOid,mergedAt,mergeCommit"
+            ),
+        ]
+    )
+    merge_commit = (pr.get("mergeCommit") or {}).get("oid")
+    if (
+        pr.get("number") != pull_request_number
+        or pr.get("state") != "MERGED"
+        or pr.get("isDraft")
+        or not pr.get("mergedAt")
+        or not merge_commit
+        or pr.get("url") != state_data.get("pull_request_url")
+        or pr.get("baseRefName") != state_data.get("base")
+        or pr.get("headRefName") != state_data.get("branch")
+        or pr.get("headRefOid") != commit
+    ):
+        fail("Merged pull request does not match the attested base/head/commit")
+    return pr
+
+
+def completed_evidence_comment_body(
+    state_data: dict[str, Any], commit: str, pr: dict[str, Any]
+) -> str:
+    merge_commit = pr["mergeCommit"]["oid"]
+    return "\n".join(
+        [
+            evidence_marker(state_data["issue"]),
+            f"## {state_data['ticket']} acceptance evidence — merged",
+            "",
+            f"- Merged pull request: {pr['url']}",
+            f"- Accepted publication commit: {immutable_commit_url(commit)}",
+            f"- Merge commit: {immutable_commit_url(merge_commit)}",
+            f"- Evidence manifest: {immutable_evidence_url(commit, state_data['evidence'])}",
+            f"- Merged at: {pr['mergedAt']}",
+            "",
+            "All substantive acceptance checks passed for the exact publication "
+            "commit, and the pull request is merged.",
+            "",
+            "Post-merge completion was explicitly approved. The issue is closed as "
+            "completed, the Project status is Done, and the ticket branch is retained.",
+            evidence_end_marker(state_data["issue"]),
+        ]
+    )
+
+
+def complete_evidence_comment(
+    state_data: dict[str, Any], commit: str, pr: dict[str, Any]
+) -> dict[str, Any]:
+    comment = json_output(
+        [
+            "gh",
+            "api",
+            f"repos/{TICKET_SLUG}/issues/comments/{state_data['comment_id']}",
+        ]
+    )
+    body = comment.get("body") or ""
+    marker = evidence_marker(state_data["issue"])
+    end_marker = evidence_end_marker(state_data["issue"])
+    if body.count(marker) != 1 or body.count(end_marker) != 1:
+        fail("Acceptance-evidence comment has ambiguous managed delimiters")
+    start_index = body.index(marker)
+    end_index = body.index(end_marker) + len(end_marker)
+    expected = completed_evidence_comment_body(state_data, commit, pr)
+    if body[start_index:end_index] != expected:
+        # Only a helper-owned, still-exact In Review comment may be promoted.
+        exact_evidence_comment(state_data, commit)
+        updated_body = body[:start_index] + expected + body[end_index:]
+        comment = json_output(
+            [
+                "gh",
+                "api",
+                "-X",
+                "PATCH",
+                f"repos/{TICKET_SLUG}/issues/comments/{state_data['comment_id']}",
+                "-f",
+                f"body={updated_body}",
+            ]
+        )
+    confirmed = json_output(
+        [
+            "gh",
+            "api",
+            f"repos/{TICKET_SLUG}/issues/comments/{state_data['comment_id']}",
+        ]
+    )
+    confirmed_body = confirmed.get("body") or ""
+    if expected not in confirmed_body or confirmed.get("id") != state_data["comment_id"]:
+        fail("Merged acceptance-evidence comment verification failed")
+    return confirmed
+
+
+def command_complete(args: argparse.Namespace) -> None:
+    with delivery_lock():
+        ensure_app_repo()
+        ensure_origin()
+        ensure_project_scope()
+        ensure_private_repositories()
+        reject_in_progress_git_operation()
+        require_clean_worktree()
+        if args.approval != POST_MERGE_APPROVAL:
+            fail("Post-merge completion requires the exact explicit approval token")
+        state_data = load_state(args.ticket)
+        verify_state_identity(state_data, args, {"IN_REVIEW", "COMPLETE"})
+        commit = state_data.get("publication_commit")
+        if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            fail("Delivery attestation has no valid publication commit")
+        issue, item = validate_ticket(
+            args.issue,
+            args.ticket,
+            args.base,
+            allowed_statuses={"In Review", "Done"},
+            require_open=False,
+        )
+        if issue.get("state") not in {"OPEN", "CLOSED"}:
+            fail(f"Unexpected issue state: {issue.get('state')!r}")
+        if remote_branch_sha(state_data["branch"]) != commit:
+            fail("The retained remote ticket branch differs from the accepted commit")
+        pr = exact_merged_pull_request(state_data, commit, args.pr)
+        comment = complete_evidence_comment(state_data, commit, pr)
+
+        if item.get("status") == "In Review":
+            metadata = project_metadata()
+            run(
+                [
+                    "gh",
+                    "project",
+                    "item-edit",
+                    "--id",
+                    item["id"],
+                    "--project-id",
+                    metadata["project_id"],
+                    "--field-id",
+                    metadata["status_field_id"],
+                    "--single-select-option-id",
+                    metadata["status_options"]["Done"],
+                ]
+            )
+        if issue.get("state") == "OPEN":
+            json_output(
+                [
+                    "gh",
+                    "api",
+                    "-X",
+                    "PATCH",
+                    f"repos/{TICKET_SLUG}/issues/{args.issue}",
+                    "-f",
+                    "state=closed",
+                    "-f",
+                    "state_reason=completed",
+                ]
+            )
+
+        confirmed_issue = issue_data(args.issue, require_open=False)
+        confirmed_item = project_item(args.issue)
+        if confirmed_issue.get("state") != "CLOSED":
+            fail("Issue closure verification failed")
+        if confirmed_item.get("status") != "Done":
+            fail("Project Done verification failed")
+        state_data.update(
+            {
+                "phase": "COMPLETE",
+                "completed_at": utc_now(),
+                "merged_at": pr["mergedAt"],
+                "merge_commit": pr["mergeCommit"]["oid"],
+                "project_status": "Done",
+                "comment_url": comment["html_url"],
+            }
+        )
+        save_state(args.ticket, state_data)
+        print(f"{args.ticket}: COMPLETE")
+        print(f"Merged PR: {pr['url']}")
+        print(f"Issue: {confirmed_issue['url']} (closed)")
+        print(f"Evidence comment: {comment['html_url']}")
+        print("Project status: Done")
+        print(f"Retained branch: {state_data['branch']}")
+
+
+def add_identity_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--issue", type=int, required=True)
+    parser.add_argument("--ticket", required=True)
+    parser.add_argument("--base", choices=sorted(ALLOWED_BASES), required=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="photography-ticket-delivery",
+        description=(
+            "Guarded automatic commit, non-force push, draft PR, evidence attachment, "
+            "and In Review transition for the independent photography app repository."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    doctor = subparsers.add_parser("doctor", help="Validate repositories and GitHub setup")
+    doctor.set_defaults(handler=command_doctor)
+
+    status_parser = subparsers.add_parser(
+        "status", help="Read current ticket, branch, and pull-request state"
+    )
+    status_parser.add_argument("--issue", type=int, required=True)
+    status_parser.set_defaults(handler=command_status)
+
+    attest = subparsers.add_parser(
+        "attest", help="Bind a READY_TO_PUBLISH verdict to an exact local snapshot"
+    )
+    add_identity_arguments(attest)
+    attest.add_argument("--evidence", required=True)
+    attest.add_argument("--title")
+    attest.add_argument("--commit-message")
+    attest.add_argument("--path", action="append", default=[])
+    attest.add_argument("--gate", required=True)
+    attest.set_defaults(handler=command_attest)
+
+    publish = subparsers.add_parser(
+        "publish", help="Commit, push, create/reuse a draft PR, and attach evidence"
+    )
+    add_identity_arguments(publish)
+    publish.set_defaults(handler=command_publish)
+
+    mark_review = subparsers.add_parser(
+        "mark-review", help="Move an exact published PASS commit to In Review"
+    )
+    add_identity_arguments(mark_review)
+    mark_review.add_argument("--commit", required=True)
+    mark_review.add_argument("--verdict", required=True)
+    mark_review.set_defaults(handler=command_mark_review)
+
+    complete = subparsers.add_parser(
+        "complete",
+        help="Close a merged ticket and mark Done after explicit approval",
+    )
+    add_identity_arguments(complete)
+    complete.add_argument("--pr", type=int, required=True)
+    complete.add_argument("--approval", required=True)
+    complete.set_defaults(handler=command_complete)
+    return parser
+
+
+def main() -> int:
+    global APP_REPO
+    try:
+        APP_REPO = select_app_worktree(Path.cwd().resolve())
+        os.chdir(APP_REPO)
+        parser = build_parser()
+        args = parser.parse_args()
+        args.handler(args)
+    except DeliveryError as exc:
+        print(f"photography-ticket-delivery: ERROR: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

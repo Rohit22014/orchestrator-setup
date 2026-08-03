@@ -1,0 +1,4 @@
+interface:
+  display_name: "Photography Integration Readiness"
+  short_description: "Check branch and dependency integration safety"
+  default_prompt: "Use $photo-integration-readiness to assess whether this ticket branch is safe to implement or publish."

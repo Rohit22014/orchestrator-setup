@@ -1,0 +1,4 @@
+interface:
+  display_name: "Photography Platform Engineering"
+  short_description: "Apply safe platform engineering practices"
+  default_prompt: "Use $photo-platform-engineering to define the engineering constraints and verification for this ticket."

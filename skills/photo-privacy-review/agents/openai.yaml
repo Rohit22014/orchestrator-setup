@@ -1,0 +1,4 @@
+interface:
+  display_name: "Photo Privacy Review"
+  short_description: "Trace private media and public data boundaries"
+  default_prompt: "Use $photo-privacy-review to audit this change for media, metadata, and location disclosure."

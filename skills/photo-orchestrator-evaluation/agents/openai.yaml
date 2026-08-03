@@ -1,0 +1,4 @@
+interface:
+  display_name: "Photography Orchestrator Evaluation"
+  short_description: "Validate local agents, skills, and guardrails"
+  default_prompt: "Use $photo-orchestrator-evaluation to validate and score the local photography orchestrator."

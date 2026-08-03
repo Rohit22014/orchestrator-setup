@@ -1,0 +1,4 @@
+interface:
+  display_name: "Photo Ticket Delivery"
+  short_description: "Publish accepted tickets as guarded draft PRs"
+  default_prompt: "Use $photo-ticket-delivery to attest and publish a READY_TO_PUBLISH ticket as a draft PR, rerun acceptance against the exact remote SHA, and move it to In Review only on PASS."

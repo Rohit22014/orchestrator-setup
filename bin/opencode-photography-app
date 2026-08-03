@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly photography_app_root="/home/rohit/photography-portfolio-platform-app"
+readonly photography_app_config_root="/home/rohit/.config/opencode/photography-portfolio-platform-app"
+
+if [[ ! -d "${photography_app_root}/.git" ]]; then
+  echo "Implementation repository is not initialized: ${photography_app_root}" >&2
+  exit 1
+fi
+
+export OPENCODE_CONFIG="${photography_app_config_root}/opencode.json"
+export OPENCODE_CONFIG_DIR="${photography_app_config_root}"
+
+cd "${photography_app_root}"
+exec /home/rohit/.npm-global/bin/opencode "$@"

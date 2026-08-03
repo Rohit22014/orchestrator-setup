@@ -1,0 +1,4 @@
+interface:
+  display_name: "Photo ADR Contract"
+  short_description: "Freeze architecture and contract decisions"
+  default_prompt: "Use $photo-adr-contract to settle the architecture and contract decisions for this ticket."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Photo Ticket Intake"
+  short_description: "Validate private roadmap tickets before work"
+  default_prompt: "Use $photo-ticket-intake to validate the selected roadmap issue before work begins."

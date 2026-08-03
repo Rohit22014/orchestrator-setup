@@ -1,0 +1,4 @@
+interface:
+  display_name: "Photo Browser Evidence"
+  short_description: "Collect efficient browser and accessibility evidence"
+  default_prompt: "Use $photo-browser-evidence to exercise this web journey and collect deterministic evidence."

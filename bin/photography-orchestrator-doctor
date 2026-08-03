@@ -1,0 +1,366 @@
+#!/usr/bin/env node
+
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
+
+const CONFIG_ROOT = "/home/rohit/.config/opencode/photography-portfolio-platform-app";
+const APP_ROOT = "/home/rohit/photography-portfolio-platform-app";
+const PLANNING_ROOT = "/home/rohit/photography-portfolio-platform";
+const AGENTS_ROOT = join(CONFIG_ROOT, "agents");
+const SKILLS_ROOT = join(CONFIG_ROOT, "skills");
+
+const expectedAgents = {
+  orchestrator: ["primary", "openai/gpt-5.6-sol", "xhigh"],
+  "platform-architect": ["subagent", "openai/gpt-5.6-terra", "xhigh"],
+  "frontend-builder": ["subagent", "openai/gpt-5.6-terra", "high"],
+  "backend-builder": ["subagent", "openai/gpt-5.6-terra", "high"],
+  "privacy-security-reviewer": ["subagent", "openai/gpt-5.6-terra", "xhigh"],
+  "repo-scout": ["subagent", "openai/gpt-5.6-luna", "low"],
+  "qa-accessibility-reviewer": ["subagent", "openai/gpt-5.6-luna", "high"],
+};
+
+const allowedDelegates = new Set([
+  "platform-architect",
+  "frontend-builder",
+  "backend-builder",
+  "privacy-security-reviewer",
+  "repo-scout",
+  "qa-accessibility-reviewer",
+]);
+
+const requiredSkills = new Set([
+  "photo-ticket-intake",
+  "photo-acceptance-gate",
+  "photo-privacy-review",
+  "photo-browser-evidence",
+  "photo-adr-contract",
+  "photo-ticket-delivery",
+  "photo-platform-engineering",
+  "photo-integration-readiness",
+  "photo-orchestrator-evaluation",
+]);
+
+const failures = [];
+const warnings = [];
+const passes = [];
+
+function record(condition, label, detail = "") {
+  const message = detail ? label + ": " + detail : label;
+  if (condition) passes.push(message);
+  else failures.push(message);
+}
+
+function warn(condition, label, detail = "") {
+  if (!condition) warnings.push(detail ? label + ": " + detail : label);
+}
+
+function read(path) {
+  return readFileSync(path, "utf8");
+}
+
+function frontmatter(markdown, path, shouldRecord = true) {
+  const match = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (shouldRecord) record(Boolean(match), "frontmatter", path);
+  return match ? match[1] : "";
+}
+
+function scalar(yaml, key) {
+  const line = yaml.split(/\r?\n/).find((candidate) => candidate.startsWith(key + ":"));
+  if (!line) return null;
+  return line.slice(key.length + 1).trim().replace(/^['"]|['"]$/g, "");
+}
+
+function permissionBlock(yaml, key) {
+  const lines = yaml.split(/\r?\n/);
+  const start = lines.findIndex((line) => new RegExp("^  " + key + ":\\s*$").test(line));
+  if (start === -1) return [];
+  const block = [];
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.trim() && !line.startsWith("    ")) break;
+    block.push(line);
+  }
+  return block;
+}
+
+function allowedNames(yaml, key) {
+  const names = [];
+  for (const line of permissionBlock(yaml, key)) {
+    const match = line.match(/^\s{4}(?:"([^"]+)"|([a-z0-9-]+)):\s*allow\s*$/);
+    if (match) names.push(match[1] || match[2]);
+  }
+  return names;
+}
+
+function setEquals(actual, expected) {
+  return actual.size === expected.size && [...actual].every((item) => expected.has(item));
+}
+
+function listDirectories(root) {
+  return readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+}
+
+function validateConfig() {
+  record(existsSync(CONFIG_ROOT), "local configuration exists", CONFIG_ROOT);
+  record(existsSync(APP_ROOT), "implementation repository exists", APP_ROOT);
+  record(realpathSync(CONFIG_ROOT) !== realpathSync(APP_ROOT), "configuration is outside implementation repository");
+  record(!realpathSync(CONFIG_ROOT).startsWith(realpathSync(APP_ROOT) + "/"), "configuration is not nested in implementation repository");
+  record(resolve(CONFIG_ROOT) !== resolve(PLANNING_ROOT), "configuration is not the planning repository");
+
+  const configPath = join(CONFIG_ROOT, "opencode.json");
+  let config;
+  try {
+    config = JSON.parse(read(configPath));
+    passes.push("opencode.json parses");
+  } catch (error) {
+    failures.push("opencode.json parses: " + error.message);
+    return;
+  }
+
+  record(config.default_agent === "orchestrator", "default agent is orchestrator");
+  record(config.model === "openai/gpt-5.6-sol", "default model is Sol");
+  record(config.small_model === "openai/gpt-5.6-luna", "small model is Luna");
+  record(config.subagent_depth === 1, "subagent depth is one");
+  record(config.share === "disabled", "sharing is disabled");
+  record(config.permission?.external_directory === "deny", "global external-directory access is denied");
+  record(config.permission?.task === "deny", "global task delegation is denied");
+  record(config.permission?.skill?.["*"] === "deny", "global skill loading is deny-by-default");
+
+  const instructions = Array.isArray(config.instructions) ? config.instructions : [];
+  record(instructions.length > 0, "project instructions are configured");
+  record(!instructions.some((item) => resolve(item).startsWith(PLANNING_ROOT + "/") || resolve(item) === PLANNING_ROOT), "instructions exclude planning repository");
+  record(instructions.every((item) => item.startsWith(APP_ROOT + "/") || item.startsWith(CONFIG_ROOT + "/")), "instructions are scoped to app or local configuration");
+
+  for (const forbidden of [".opencode", "opencode.json", "AGENTS.md"]) {
+    record(!existsSync(join(APP_ROOT, forbidden)), "repository excludes local orchestrator artifact", forbidden);
+  }
+
+  const remoteConfig = join(APP_ROOT, ".git", "config");
+  if (existsSync(remoteConfig)) {
+    const gitConfig = read(remoteConfig);
+    record(gitConfig.includes("Rohit22014/photography-portfolio-platform-app"), "origin targets implementation repository");
+    record(!gitConfig.includes("Rohit22014/photography-portfolio-platform.git"), "origin excludes planning repository");
+  } else {
+    failures.push("implementation repository Git configuration is missing");
+  }
+
+  const actualAgents = readdirSync(AGENTS_ROOT)
+    .filter((file) => file.endsWith(".md"))
+    .map((file) => file.slice(0, -3))
+    .sort();
+  record(setEquals(new Set(actualAgents), new Set(Object.keys(expectedAgents))), "agent roster is exact", actualAgents.join(", "));
+
+  const actualSkills = listDirectories(SKILLS_ROOT);
+  record([...requiredSkills].every((skill) => actualSkills.includes(skill)), "required skills are installed");
+
+  for (const [name, [mode, model, effort]] of Object.entries(expectedAgents)) {
+    const path = join(AGENTS_ROOT, name + ".md");
+    if (!existsSync(path)) {
+      failures.push("agent file missing: " + name);
+      continue;
+    }
+    const body = read(path);
+    const yaml = frontmatter(body, path);
+    record(scalar(yaml, "mode") === mode, name + " mode", mode);
+    record(scalar(yaml, "model") === model, name + " model", model);
+    record(scalar(yaml, "reasoningEffort") === effort, name + " reasoning effort", effort);
+    record(/^\s{2}external_directory:\s*deny\s*$/m.test(yaml), name + " denies external directories");
+    record(!yaml.includes('"git diff *": allow'), name + " has no broad range-diff allowlist");
+
+    const skills = allowedNames(yaml, "skill");
+    for (const skill of skills) {
+      if (skill !== "*") record(actualSkills.includes(skill), name + " references installed skill", skill);
+    }
+
+    if (name === "orchestrator") {
+      record(/^\s{2}edit:\s*ask\s*$/m.test(yaml), "orchestrator direct edits require approval");
+      record(setEquals(new Set(allowedNames(yaml, "task")), allowedDelegates), "orchestrator delegation roster is exact");
+      for (const skill of ["photo-platform-engineering", "photo-integration-readiness", "photo-orchestrator-evaluation"]) {
+        record(skills.includes(skill), "orchestrator can load selective skill", skill);
+      }
+      for (const denial of [
+        '"git commit*": deny',
+        '"git push*": deny',
+        '"gh api *": deny',
+        '"gh pr merge*": deny',
+        '"gh project item-edit*": deny',
+      ]) {
+        record(yaml.includes(denial), "orchestrator raw mutation remains denied", denial);
+      }
+    } else {
+      record(/^\s{2}task:\s*deny\s*$/m.test(yaml), name + " cannot delegate");
+      const builder = name === "frontend-builder" || name === "backend-builder";
+      record(new RegExp("^  edit:\\s*" + (builder ? "allow" : "deny") + "\\s*$", "m").test(yaml), name + " write permission matches role");
+      if (builder) {
+        record(yaml.includes('"gh *": deny'), name + " cannot mutate GitHub");
+        record(yaml.includes('"git commit*": deny'), name + " cannot commit");
+        record(yaml.includes('"git push*": deny'), name + " cannot push");
+        record(yaml.includes('"photography-ticket-delivery *": deny'), name + " cannot invoke delivery helper");
+      }
+    }
+  }
+
+  record(existsSync("/home/rohit/.local/bin/opencode-photography-app"), "dedicated OpenCode wrapper exists");
+  record(existsSync("/home/rohit/.local/bin/photography-ticket-delivery"), "guarded ticket-delivery helper exists");
+}
+
+function validateSkills() {
+  for (const name of listDirectories(SKILLS_ROOT)) {
+    const root = join(SKILLS_ROOT, name);
+    const skillPath = join(root, "SKILL.md");
+    const uiPath = join(root, "agents", "openai.yaml");
+    record(existsSync(skillPath), "skill entrypoint exists", name);
+    record(existsSync(uiPath), "skill UI metadata exists", name);
+    if (!existsSync(skillPath)) continue;
+
+    const markdown = read(skillPath);
+    const yaml = frontmatter(markdown, skillPath);
+    record(scalar(yaml, "name") === name, "skill name matches folder", name);
+    const description = scalar(yaml, "description") || "";
+    record(description.length >= 40 && description.includes("Use "), "skill description includes concrete trigger", name);
+    record(!/\[TODO|TODO:|Replace with|Complete and informative/i.test(markdown), "skill has no template placeholders", name);
+    record(markdown.split(/\r?\n/).length <= 500, "skill stays below 500 lines", name);
+
+    for (const match of markdown.matchAll(/\]\(([^)]+)\)/g)) {
+      const target = match[1].split("#")[0];
+      if (!target || /^[a-z]+:/i.test(target)) continue;
+      record(existsSync(resolve(dirname(skillPath), target)), "skill reference resolves", name + " -> " + target);
+    }
+
+    if (existsSync(uiPath)) {
+      const ui = read(uiPath);
+      record(ui.includes("$" + name), "skill default prompt names the skill", name);
+      record(!/\[TODO|TODO:|Replace with|Complete and informative/i.test(ui), "skill UI metadata has no template placeholders", name);
+    }
+  }
+}
+
+function skillScores() {
+  const rows = [];
+  for (const name of listDirectories(SKILLS_ROOT)) {
+    const root = join(SKILLS_ROOT, name);
+    const skillPath = join(root, "SKILL.md");
+    const uiPath = join(root, "agents", "openai.yaml");
+    if (!existsSync(skillPath)) {
+      rows.push([name, 0, "missing SKILL.md"]);
+      continue;
+    }
+    const markdown = read(skillPath);
+    const yaml = frontmatter(markdown, skillPath, false);
+    const description = scalar(yaml, "description") || "";
+    const lines = markdown.split(/\r?\n/).length;
+    let score = 0;
+    const gaps = [];
+
+    if (scalar(yaml, "name") === name && description.length >= 40) score += 10;
+    else gaps.push("identity");
+    if (description.includes("Use ")) score += 10;
+    else gaps.push("triggers");
+    if (lines <= 500 && lines >= 12) score += 10;
+    else gaps.push("context-size");
+    if (!/\[TODO|TODO:|Replace with|Complete and informative/i.test(markdown)) score += 10;
+    else gaps.push("placeholders");
+    if (/## (Workflow|Review|Required sequence|Evidence loop|Decision authority|Route the work|Preconditions)/i.test(markdown)) score += 15;
+    else gaps.push("procedure");
+    if (/evidence|verify|verification|check|verdict/i.test(markdown)) score += 15;
+    else gaps.push("verification");
+    if (/never|do not|stop|blocker|hard stop/i.test(markdown)) score += 10;
+    else gaps.push("safety");
+
+    let referencesOkay = true;
+    for (const match of markdown.matchAll(/\]\(([^)]+)\)/g)) {
+      const target = match[1].split("#")[0];
+      if (target && !/^[a-z]+:/i.test(target) && !existsSync(resolve(dirname(skillPath), target))) {
+        referencesOkay = false;
+      }
+    }
+    if (referencesOkay) score += 10;
+    else gaps.push("references");
+    if (existsSync(uiPath) && read(uiPath).includes("$" + name)) score += 10;
+    else gaps.push("ui-prompt");
+
+    rows.push([name, score, gaps.length ? gaps.join(",") : "-"]);
+    warn(score >= 80, "skill quality score below 80", name + "=" + score);
+  }
+  return rows;
+}
+
+function configurationHash() {
+  const hash = createHash("sha256");
+  const files = [
+    join(CONFIG_ROOT, "opencode.json"),
+    join(CONFIG_ROOT, "AGENTS.md"),
+    join(CONFIG_ROOT, "WORKFLOW.md"),
+    "/home/rohit/.local/bin/opencode-photography-app",
+    "/home/rohit/.local/bin/photography-ticket-delivery",
+    "/home/rohit/.local/bin/photography-orchestrator-doctor",
+    ...readdirSync(AGENTS_ROOT).filter((file) => file.endsWith(".md")).sort().map((file) => join(AGENTS_ROOT, file)),
+    ...listDirectories(SKILLS_ROOT).flatMap((name) => {
+      const root = join(SKILLS_ROOT, name);
+      const files = [join(root, "SKILL.md"), join(root, "agents", "openai.yaml")];
+      const references = join(root, "references");
+      if (existsSync(references)) {
+        files.push(...readdirSync(references).filter((file) => file.endsWith(".md")).sort().map((file) => join(references, file)));
+      }
+      return files.filter(existsSync);
+    }),
+  ];
+  for (const file of files) {
+    hash.update(relative(CONFIG_ROOT, file));
+    hash.update("\0");
+    hash.update(read(file));
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+function printValidation() {
+  console.log("Photography orchestrator validation");
+  console.log("Config: " + CONFIG_ROOT);
+  console.log("Hash: " + configurationHash());
+  console.log("Passed checks: " + passes.length);
+  if (warnings.length) {
+    console.log("\nWarnings:");
+    for (const item of warnings) console.log("- " + item);
+  }
+  if (failures.length) {
+    console.log("\nFailures:");
+    for (const item of failures) console.log("- " + item);
+  } else {
+    console.log("Verdict: PASS");
+  }
+}
+
+function printScores(rows) {
+  console.log("Photography skill static evaluation");
+  console.log("Skill | Score | Gaps");
+  console.log("--- | ---: | ---");
+  for (const [name, score, gaps] of rows) console.log(name + " | " + score + " | " + gaps);
+  const average = rows.length
+    ? Math.round(rows.reduce((sum, row) => sum + row[1], 0) / rows.length)
+    : 0;
+  console.log("Average: " + average);
+  console.log("Scores are maintenance signals, not application-ticket acceptance evidence.");
+}
+
+const command = process.argv[2] || "all";
+if (!["validate", "evaluate", "all"].includes(command)) {
+  console.error("Usage: photography-orchestrator-doctor [validate|evaluate|all]");
+  process.exit(2);
+}
+
+if (command === "validate" || command === "all") {
+  validateConfig();
+  validateSkills();
+}
+const rows = command === "evaluate" || command === "all" ? skillScores() : [];
+if (command === "validate" || command === "all") printValidation();
+if (command === "evaluate" || command === "all") {
+  if (command === "all") console.log("");
+  printScores(rows);
+}
+process.exitCode = failures.length ? 1 : 0;
