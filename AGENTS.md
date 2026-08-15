@@ -13,7 +13,9 @@ This file is intentionally outside the Git repository. It governs OpenCode sessi
   repository is `Rohit22014/photography-portfolio-platform-app`.
 - Do not access any external directory; the implementation repository contains the required handoff context.
 - Do not add `.opencode`, `opencode.json`, `AGENTS.md`, or other agent configuration to the repository.
-- Keep sharing disabled and never start OpenCode with `--auto`.
+- Keep sharing disabled. The owner authorizes launching the dedicated wrapper
+  with `--auto`; it does not override explicit deny rules or replace any
+  ticket-specific approval required by this workflow.
 
 ## Issue-driven delivery
 
@@ -34,10 +36,37 @@ This file is intentionally outside the Git repository. It governs OpenCode sessi
     snapshot, and let its guarded helper commit, non-force push, create a draft
     PR, and attach immutable acceptance evidence.
 15. Rerun the full acceptance gate against the exact published SHA and URLs.
-16. Only an exact-head `PASS` lets the helper move Todo or In Progress to
+16. If a reviewed fix commit strictly advances the draft PR before review,
+    append it through `photography-ticket-delivery amend` only after exact-head
+    `PASS`; preserve the original publication and evidence history.
+17. Only an exact-head `PASS` lets the helper move Todo or In Progress to
     `In Review`. Report the handoff and stop before selecting another ticket.
+18. In a later turn with explicit approval for the exact ticket and pull
+    request, delegate merge, guarded completion, and next-ticket prompt creation
+    to `post-merge-coordinator`. It verifies the accepted SHA, retains the
+    branch and worktree, and never starts the next ticket.
 
 Run only one writing agent in a worktree. Separate frontend and backend writers require separate worktrees created from this implementation repository after an approved baseline commit and settled shared contracts.
+
+## Runtime cleanup boundaries
+
+- Delegate cleanup only to `runtime-cleanup-coordinator` after the user asks for
+  cleanup or approves an exact recovery plan. Read-only inventory is not
+  cleanup authorization.
+- Never clean resources used by an active builder, verifier, OpenCode writer,
+  or another worktree. Serialize cleanup after the affected run stops.
+- Every process signal and Docker removal remains approval-gated except the
+  wrapper-launched deterministic supervisor's narrow standing authorization to
+  send `SIGTERM` to an exact verifier after its high-confidence terminal,
+  connection-failure, stopped-container, ancestry, worktree, age, and
+  PID/start-time gates all pass. It never sends `SIGKILL` or mutates Docker.
+  It targets the executable verifier leaf, not its shell pipeline; a reparented
+  leaf remains eligible only through an unchanged, previously observed
+  descendant identity fingerprint.
+  Global prune commands are forbidden. Persistent volumes require separate
+  approval naming each exact volume and acknowledging data loss.
+- Cleanup never removes Git branches, worktrees, repository files, acceptance
+  evidence, attestations, or delivery state.
 
 ## Git boundaries
 
@@ -49,13 +78,28 @@ Run only one writing agent in a worktree. Separate frontend and backend writers 
 - The orchestrator may automatically commit, non-force push, create or reuse a
   matching draft pull request, attach one stable evidence comment, and move the
   ticket to `In Review` only through `photography-ticket-delivery`.
+- GitHub access uses high-level `gh` commands only. `gh api`, direct REST, and
+  direct GraphQL are prohibited. The guarded helper also uses only high-level
+  GitHub CLI commands.
+- Direct mutating `gh` commands remain approval-required and are limited to
+  explicitly authorized operations outside the helper's automatic ticket
+  workflow, such as owner decision comments or an approved merge.
+- The reviewed AUTH-02 cross-lane integration has one narrow publication
+  exception: the orchestrator may run only the exact approved integration-02
+  commit command and the exact non-force upstream push for
+  `INTEGRATION/backend-into-frontend-for-auth-02`. General commit and push
+  commands remain denied. The same exception permits only a draft PR from that
+  branch into `frontend`, read-only PR-check polling, and an AUTH-02 #10
+  readiness comment; it does not permit merge, closure, Done, or implementation.
 - Builders and reviewers never commit, push, create PRs, comment, or update
   Project fields. They return implementation and evidence to the orchestrator.
 - Merge, issue closure, `Done`, force-push, remote creation or mutation,
   rebasing or rewriting shared history, branch deletion, and file deletion
-  require explicit user approval. After a merge, the delivery helper may close
-  the app issue and mark `Done` only through its explicit ticket-specific
-  `complete` command; it never merges or deletes the retained branch.
+  require explicit user approval. After that approval, only the
+  `post-merge-coordinator` may mark the named PR ready, perform its normal
+  non-auto merge, and invoke the delivery helper's explicit ticket-specific
+  `complete` command. The helper closes the app issue and marks `Done`; neither
+  the agent nor helper deletes the retained branch or worktree.
 - Never configure or use the planning repository's remote here.
 - Never discard user changes with reset, clean, checkout, or restore.
 - Preserve unrelated or pre-existing worktree changes.
@@ -100,11 +144,13 @@ Run only one writing agent in a worktree. Separate frontend and backend writers 
 - `photo-browser-evidence`: frontend builder for browser evidence; QA reviewer inspects the resulting evidence.
 - `photo-acceptance-gate`: orchestrator, builder, and QA reviewer before
   publication and again against the exact published SHA.
-- `photo-ticket-delivery`: orchestrator only, after `READY_TO_PUBLISH` and after
-  the published SHA receives `PASS`.
+- `photo-ticket-delivery`: orchestrator for publication after
+  `READY_TO_PUBLISH` and exact-head `PASS`; post-merge coordinator for the
+  approval-gated `complete` command only.
 - `photo-platform-engineering`: architect, builders, and reviewers for production engineering; load only applicable references.
 - `photo-integration-readiness`: orchestrator and scout before dependent work and publication.
 - `photo-orchestrator-evaluation`: orchestrator after local setup or OpenCode changes.
+- `photo-runtime-cleanup`: runtime cleanup coordinator for inventory, hung-run recovery, and explicitly approved ticket-owned cleanup.
 
 Skills live only in the external OpenCode configuration. Do not copy them into the repository.
 
@@ -112,6 +158,8 @@ Skills live only in the external OpenCode configuration. Do not copy them into t
 
 - Run `photography-orchestrator-doctor validate` after any local agent, skill, permission, wrapper, helper, or OpenCode change.
 - Run `photography-orchestrator-doctor evaluate` to score skill trigger quality, progressive disclosure, safety, verification guidance, references, and UI metadata.
+- The doctor must also prove that the helper and QA reviewer cannot use
+  `gh api`, REST, GraphQL, or GitHub web access.
 - Static scores are maintenance signals. They never replace issue acceptance evidence or the two publication gates.
 
 ## Initial sequence

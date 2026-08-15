@@ -703,6 +703,7 @@ def command_doctor(_: argparse.Namespace) -> None:
         "Automatic after two acceptance gates: commit, non-force push, draft PR, "
         "evidence comment, In Review"
     )
+    print("Guarded post-publication amendments: append-only exact-head evidence chain")
     print("Approval-gated through complete: merged evidence, issue closure, Done")
     print("Never performed: merge, force-push, remote changes, branch/file deletion")
 
@@ -751,6 +752,11 @@ def command_status(args: argparse.Namespace) -> None:
         attestation = {
             "phase": local_state.get("phase"),
             "publication_commit": local_state.get("publication_commit"),
+            "initial_publication_commit": local_state.get(
+                "initial_publication_commit"
+            ),
+            "amendments": local_state.get("amendments", []),
+            "pending_amendment": local_state.get("pending_amendment"),
             "evidence": local_state.get("evidence"),
             "pull_request_url": local_state.get("pull_request_url"),
             "comment_url": local_state.get("comment_url"),
@@ -952,6 +958,109 @@ def is_ancestor(ancestor: str, descendant: str) -> bool:
     if result.returncode not in {0, 1}:
         fail(result.stderr.strip() or "Unable to verify Git ancestry")
     return result.returncode == 0
+
+
+def commit_blob_oid(commit: str, path: str) -> str:
+    tree = subprocess.run(
+        ["git", "ls-tree", "-z", commit, "--", path],
+        cwd=APP_REPO,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if tree.returncode != 0 or not tree.stdout.endswith(b"\0"):
+        fail(f"Unable to inspect committed blob for {path} at {commit}")
+    records = [record for record in tree.stdout.split(b"\0") if record]
+    if len(records) != 1 or b"\t" not in records[0]:
+        fail(f"Expected one committed tree entry for {path} at {commit}")
+    metadata, raw_path = records[0].split(b"\t", 1)
+    fields = metadata.decode("ascii", "strict").split()
+    if (
+        len(fields) != 3
+        or fields[1] != "blob"
+        or not re.fullmatch(r"[0-9a-f]{40}", fields[2])
+        or os.fsdecode(raw_path) != path
+    ):
+        fail(f"Unexpected committed tree entry for {path} at {commit}")
+    return fields[2]
+
+
+def amendment_delta(
+    previous_commit: str, commit: str, attested_roots: list[str]
+) -> list[dict[str, str]]:
+    if previous_commit == commit:
+        fail("Amendment commit must strictly descend from the published attestation")
+    if not is_ancestor(previous_commit, commit):
+        fail("Amendment commit does not descend from the published attestation")
+    changed = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            f"{previous_commit}..{commit}",
+            "--",
+        ],
+        cwd=APP_REPO,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if changed.returncode != 0:
+        fail(os.fsdecode(changed.stderr).strip() or "Unable to inspect amendment delta")
+    parts = [part for part in changed.stdout.split(b"\0") if part]
+    if len(parts) % 2:
+        fail("Unable to parse the amendment delta safely")
+    delta: list[dict[str, str]] = []
+    for index in range(0, len(parts), 2):
+        status_code = parts[index].decode("ascii", "strict")
+        path = normalize_repo_path(os.fsdecode(parts[index + 1]))
+        if status_code != "M":
+            fail(
+                "Post-publication amendments may only modify already-attested "
+                f"paths; found {status_code} for {path}"
+            )
+        reject_protected_path(path)
+        if not manifest_covers(path, attested_roots):
+            fail(f"Amendment path is outside the original attested manifest: {path}")
+        delta.append({"path": path, "status": status_code})
+    if not delta:
+        fail("Amendment commit has no eligible file changes")
+    return sorted(delta, key=lambda entry: entry["path"])
+
+
+def validate_amendment_chain(state_data: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = state_data.get("amendments", [])
+    if not isinstance(raw, list):
+        fail("Delivery attestation has a malformed amendment history")
+    if not raw:
+        initial = state_data.get("initial_publication_commit")
+        if initial not in {None, state_data.get("publication_commit")}:
+            fail("Delivery attestation has an inconsistent initial publication commit")
+        return []
+    initial = state_data.get("initial_publication_commit")
+    if not isinstance(initial, str) or not re.fullmatch(r"[0-9a-f]{40}", initial):
+        fail("Delivery attestation has no valid initial publication commit")
+    expected_previous = initial
+    amendments: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw, start=1):
+        if not isinstance(entry, dict):
+            fail(f"Delivery amendment {index} is malformed")
+        previous = entry.get("previous_publication_commit")
+        current = entry.get("publication_commit")
+        if (
+            previous != expected_previous
+            or not isinstance(current, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", current)
+            or current == previous
+        ):
+            fail(f"Delivery amendment {index} breaks the append-only commit chain")
+        expected_previous = current
+        amendments.append(entry)
+    if expected_previous != state_data.get("publication_commit"):
+        fail("Delivery amendment history does not end at the publication commit")
+    return amendments
 
 
 def remote_branch_sha(branch: str) -> str | None:
@@ -1205,23 +1314,106 @@ def immutable_evidence_url(commit: str, evidence: str) -> str:
 
 
 def list_issue_comments(issue_number: int) -> list[dict[str, Any]]:
+    data = json_output(
+        [
+            "gh",
+            "issue",
+            "view",
+            str(issue_number),
+            "--repo",
+            TICKET_SLUG,
+            "--json",
+            "comments",
+        ]
+    )
+    raw_comments = data.get("comments")
+    if not isinstance(raw_comments, list):
+        fail("GitHub CLI returned an unexpected issue-comment response")
     comments: list[dict[str, Any]] = []
-    page = 1
-    while True:
-        batch = json_output(
-            [
-                "gh",
-                "api",
-                f"repos/{TICKET_SLUG}/issues/{issue_number}/comments"
-                f"?per_page=100&page={page}",
-            ]
+    for raw in raw_comments:
+        if not isinstance(raw, dict):
+            fail("GitHub CLI returned a malformed issue comment")
+        url = raw.get("url")
+        if not isinstance(url, str) or not url.startswith(
+            f"https://github.com/{TICKET_SLUG}/issues/{issue_number}#issuecomment-"
+        ):
+            fail("GitHub CLI returned an unexpected issue-comment URL")
+        comments.append({**raw, "html_url": url})
+    return comments
+
+
+def find_issue_comment(
+    issue_number: int,
+    *,
+    comment_id: Any | None = None,
+    comment_url: str | None = None,
+    marker: str | None = None,
+) -> dict[str, Any]:
+    comments = list_issue_comments(issue_number)
+    matches = [
+        comment
+        for comment in comments
+        if (comment_url and comment.get("html_url") == comment_url)
+        or (comment_id is not None and comment.get("id") == comment_id)
+    ]
+    if not matches and marker:
+        matches = [
+            comment for comment in comments if marker in (comment.get("body") or "")
+        ]
+    if len(matches) != 1:
+        fail(
+            "Expected exactly one matching issue comment through GitHub CLI; "
+            f"found {len(matches)}"
         )
-        if not isinstance(batch, list):
-            fail("Issue comments endpoint returned an unexpected response")
-        comments.extend(batch)
-        if len(batch) < 100:
-            return comments
-        page += 1
+    return matches[0]
+
+
+def create_issue_comment(issue_number: int, body: str) -> dict[str, Any]:
+    result = run(
+        [
+            "gh",
+            "issue",
+            "comment",
+            str(issue_number),
+            "--repo",
+            TICKET_SLUG,
+            "--body-file",
+            "-",
+        ],
+        input_text=body,
+    )
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        fail("GitHub CLI did not return exactly one created comment URL")
+    return find_issue_comment(issue_number, comment_url=lines[0])
+
+
+def edit_issue_comment(
+    issue_number: int, target: dict[str, Any], body: str
+) -> dict[str, Any]:
+    comments = list_issue_comments(issue_number)
+    viewer_comments = [comment for comment in comments if comment.get("viewerDidAuthor")]
+    target_url = target.get("html_url")
+    if not viewer_comments or viewer_comments[-1].get("html_url") != target_url:
+        fail(
+            "The managed evidence comment is not the authenticated user's latest "
+            "comment; GitHub CLI cannot safely edit it by identity"
+        )
+    run(
+        [
+            "gh",
+            "issue",
+            "comment",
+            str(issue_number),
+            "--repo",
+            TICKET_SLUG,
+            "--edit-last",
+            "--body-file",
+            "-",
+        ],
+        input_text=body,
+    )
+    return find_issue_comment(issue_number, comment_url=target_url)
 
 
 def evidence_marker(issue_number: int) -> str:
@@ -1236,17 +1428,47 @@ def evidence_end_marker(issue_number: int) -> str:
     )
 
 
+def publication_history_lines(state_data: dict[str, Any]) -> list[str]:
+    amendments = validate_amendment_chain(state_data)
+    if not amendments:
+        return []
+    evidence = state_data["evidence"]
+    initial = state_data["initial_publication_commit"]
+    lines = ["", "### Publication history", ""]
+    history: list[tuple[str, str, str | None]] = [
+        ("Initial publication", initial, state_data.get("published_at"))
+    ]
+    history.extend(
+        (
+            f"Amendment {index}",
+            entry["publication_commit"],
+            entry.get("amended_at"),
+        )
+        for index, entry in enumerate(amendments, start=1)
+    )
+    for label, commit, timestamp in history:
+        suffix = f" at {timestamp}" if timestamp else ""
+        lines.append(
+            f"- {label}{suffix}: {immutable_commit_url(commit)} "
+            f"(evidence: {immutable_evidence_url(commit, evidence)})"
+        )
+    return lines
+
+
 def evidence_comment_body(
     state_data: dict[str, Any], commit: str, pr: dict[str, Any]
 ) -> str:
-    return "\n".join(
+    lines = [
+        evidence_marker(state_data["issue"]),
+        f"## {state_data['ticket']} acceptance evidence",
+        "",
+        f"- Draft pull request: {pr['url']}",
+        f"- Publication commit: {immutable_commit_url(commit)}",
+        f"- Evidence manifest: {immutable_evidence_url(commit, state_data['evidence'])}",
+    ]
+    lines.extend(publication_history_lines(state_data))
+    lines.extend(
         [
-            evidence_marker(state_data["issue"]),
-            f"## {state_data['ticket']} acceptance evidence",
-            "",
-            f"- Draft pull request: {pr['url']}",
-            f"- Publication commit: {immutable_commit_url(commit)}",
-            f"- Evidence manifest: {immutable_evidence_url(commit, state_data['evidence'])}",
             "",
             "All substantive local acceptance checks passed for this exact commit. "
             "The draft PR is ready for review.",
@@ -1256,6 +1478,7 @@ def evidence_comment_body(
             evidence_end_marker(state_data["issue"]),
         ]
     )
+    return "\n".join(lines)
 
 
 def create_or_update_evidence_comment(
@@ -1280,17 +1503,7 @@ def create_or_update_evidence_comment(
     body = evidence_comment_body(state_data, commit, pr)
     updated_body = body
     if target is None:
-        target = json_output(
-            [
-                "gh",
-                "api",
-                "-X",
-                "POST",
-                f"repos/{TICKET_SLUG}/issues/{state_data['issue']}/comments",
-                "-f",
-                f"body={body}",
-            ]
-        )
+        target = create_issue_comment(state_data["issue"], body)
     else:
         existing_body = target.get("body") or ""
         end_marker = evidence_end_marker(state_data["issue"])
@@ -1316,23 +1529,13 @@ def create_or_update_evidence_comment(
             prefix = existing_body.rstrip()
             updated_body = f"{prefix}\n\n{body}" if prefix else body
         if existing_body != updated_body:
-            target = json_output(
-                [
-                    "gh",
-                    "api",
-                    "-X",
-                    "PATCH",
-                    f"repos/{TICKET_SLUG}/issues/comments/{target['id']}",
-                    "-f",
-                    f"body={updated_body}",
-                ]
+            target = edit_issue_comment(
+                state_data["issue"], target, updated_body
             )
-    confirmed = json_output(
-        [
-            "gh",
-            "api",
-            f"repos/{TICKET_SLUG}/issues/comments/{target['id']}",
-        ]
+    confirmed = find_issue_comment(
+        state_data["issue"],
+        comment_id=target.get("id"),
+        comment_url=target.get("html_url"),
     )
     if confirmed.get("body") != updated_body or confirmed.get(
         "html_url"
@@ -1349,6 +1552,9 @@ def command_publish(args: argparse.Namespace) -> None:
         reject_pre_staged_changes()
         reject_active_git_hooks()
         state_data = load_state(args.ticket)
+        if state_data.get("pending_amendment"):
+            fail("A post-publication amendment is pending; rerun amend to recover it")
+        validate_amendment_chain(state_data)
         if state_data.get("phase") in {
             "PUBLISHED_AWAITING_FINAL_GATE",
             "IN_REVIEW",
@@ -1525,12 +1731,11 @@ def exact_pull_request(state_data: dict[str, Any], commit: str) -> dict[str, Any
 
 
 def exact_evidence_comment(state_data: dict[str, Any], commit: str) -> dict[str, Any]:
-    comment = json_output(
-        [
-            "gh",
-            "api",
-            f"repos/{TICKET_SLUG}/issues/comments/{state_data['comment_id']}",
-        ]
+    comment = find_issue_comment(
+        state_data["issue"],
+        comment_id=state_data.get("comment_id"),
+        comment_url=state_data.get("comment_url"),
+        marker=evidence_marker(state_data["issue"]),
     )
     body = comment.get("body") or ""
     marker = evidence_marker(state_data["issue"])
@@ -1559,6 +1764,159 @@ def exact_evidence_comment(state_data: dict[str, Any], commit: str) -> dict[str,
     return comment
 
 
+def validate_live_amendment(
+    state_data: dict[str, Any],
+    args: argparse.Namespace,
+    previous_commit: str,
+    commit: str,
+) -> tuple[dict[str, Any], list[dict[str, str]], str]:
+    _, item = validate_ticket(
+        args.issue,
+        args.ticket,
+        args.base,
+        allowed_statuses={"Todo", "In Progress"},
+    )
+    if validate_branch(args.ticket) != state_data["branch"]:
+        fail("Current branch differs from the published branch")
+    if output(["git", "rev-parse", "HEAD"]) != commit:
+        fail("Local HEAD differs from the requested amendment commit")
+    require_clean_worktree()
+    base_commit = fetch_base(args.base)
+    if base_commit != state_data.get("base_commit_at_attest"):
+        fail(
+            f"origin/{args.base} changed after the original attestation; "
+            "a new integration decision is required"
+        )
+    if not is_ancestor(base_commit, commit):
+        fail(f"origin/{args.base} is not an ancestor of amendment commit {commit}")
+    if remote_branch_sha(state_data["branch"]) != commit:
+        fail("Remote ticket branch differs from the requested amendment commit")
+    pr = exact_pull_request(state_data, commit)
+    roots = state_data.get("paths")
+    if not isinstance(roots, list) or not all(isinstance(path, str) for path in roots):
+        fail("Published attestation has no valid original path manifest")
+    delta = amendment_delta(previous_commit, commit, roots)
+    evidence = state_data.get("evidence")
+    if not isinstance(evidence, str):
+        fail("Published attestation has no valid evidence path")
+    previous_evidence_blob = commit_blob_oid(previous_commit, evidence)
+    amended_evidence_blob = commit_blob_oid(commit, evidence)
+    if amended_evidence_blob != previous_evidence_blob:
+        fail("Post-publication amendment changed the acceptance-evidence blob")
+    evidence_entries = [
+        entry
+        for entry in state_data.get("snapshot", [])
+        if isinstance(entry, dict) and entry.get("path") == evidence
+    ]
+    if len(evidence_entries) != 1 or evidence_entries[0].get("blob") != amended_evidence_blob:
+        fail("Acceptance-evidence blob differs from the original attested manifest")
+    state_data["project_status"] = item["status"]
+    return pr, delta, amended_evidence_blob
+
+
+def command_amend(args: argparse.Namespace) -> None:
+    with delivery_lock():
+        ensure_app_repo()
+        ensure_origin()
+        ensure_project_scope()
+        ensure_private_repositories()
+        reject_in_progress_git_operation()
+        reject_pre_staged_changes()
+        if args.verdict != "PASS":
+            fail("Post-publication amendment requires the exact-head verdict PASS")
+        if not re.fullmatch(r"[0-9a-f]{40}", args.commit):
+            fail("--commit must be a full 40-character Git SHA")
+        state_data = load_state(args.ticket)
+        verify_state_identity(state_data, args, "PUBLISHED_AWAITING_FINAL_GATE")
+        amendments = validate_amendment_chain(state_data)
+        pending = state_data.get("pending_amendment")
+
+        if pending is not None:
+            if not isinstance(pending, dict) or pending.get("publication_commit") != args.commit:
+                fail("A different post-publication amendment is pending recovery")
+            if not amendments:
+                fail("Pending amendment has no append-only history record")
+            latest = amendments[-1]
+            if latest.get("publication_commit") != args.commit:
+                fail("Pending amendment differs from the latest history record")
+            previous_commit = latest["previous_publication_commit"]
+            pr, delta, evidence_blob = validate_live_amendment(
+                state_data, args, previous_commit, args.commit
+            )
+            if latest.get("delta") != delta or latest.get("evidence_blob") != evidence_blob:
+                fail("Pending amendment record differs from the live commit delta")
+        elif state_data.get("publication_commit") == args.commit:
+            if not amendments:
+                fail("Requested commit is already published without an amendment")
+            latest = amendments[-1]
+            previous_commit = latest["previous_publication_commit"]
+            pr, delta, evidence_blob = validate_live_amendment(
+                state_data, args, previous_commit, args.commit
+            )
+            if latest.get("delta") != delta or latest.get("evidence_blob") != evidence_blob:
+                fail("Stored amendment record differs from the live commit delta")
+            exact_evidence_comment(state_data, args.commit)
+            print(f"PUBLISHED_AWAITING_FINAL_GATE for {args.ticket} (already amended)")
+            print(f"Commit: {args.commit}")
+            print(f"Draft PR: {pr['url']}")
+            print(f"Evidence comment: {state_data['comment_url']}")
+            return
+        else:
+            previous_commit = state_data.get("publication_commit")
+            if not isinstance(previous_commit, str) or not re.fullmatch(
+                r"[0-9a-f]{40}", previous_commit
+            ):
+                fail("Published attestation has no valid publication commit")
+            exact_evidence_comment(state_data, previous_commit)
+            pr, delta, evidence_blob = validate_live_amendment(
+                state_data, args, previous_commit, args.commit
+            )
+            amended_at = utc_now()
+            if not amendments:
+                state_data["initial_publication_commit"] = previous_commit
+            record = {
+                "amended_at": amended_at,
+                "previous_publication_commit": previous_commit,
+                "publication_commit": args.commit,
+                "evidence_blob": evidence_blob,
+                "delta": delta,
+                "verdict": args.verdict,
+            }
+            state_data.setdefault("amendments", []).append(record)
+            state_data.update(
+                {
+                    "publication_commit": args.commit,
+                    "last_amended_at": amended_at,
+                    "pending_amendment": {
+                        "previous_publication_commit": previous_commit,
+                        "publication_commit": args.commit,
+                    },
+                }
+            )
+            validate_amendment_chain(state_data)
+            # Persist the new exact-head pointer before editing the remote comment.
+            # If the process stops between these writes, rerunning amend safely
+            # resumes the idempotent comment update from pending_amendment.
+            save_state(args.ticket, state_data)
+
+        comment = create_or_update_evidence_comment(state_data, args.commit, pr)
+        state_data.pop("pending_amendment", None)
+        state_data.update(
+            {
+                "comment_id": comment["id"],
+                "comment_url": comment["html_url"],
+            }
+        )
+        save_state(args.ticket, state_data)
+        exact_evidence_comment(state_data, args.commit)
+        print(f"PUBLISHED_AWAITING_FINAL_GATE for {args.ticket} (amended)")
+        print(f"Previous commit: {previous_commit}")
+        print(f"Commit: {args.commit}")
+        print(f"Draft PR: {pr['url']}")
+        print(f"Evidence comment: {comment['html_url']}")
+        print("Original publication evidence remains recorded in the amendment history.")
+
+
 def command_mark_review(args: argparse.Namespace) -> None:
     with delivery_lock():
         ensure_app_repo()
@@ -1569,6 +1927,9 @@ def command_mark_review(args: argparse.Namespace) -> None:
         if not re.fullmatch(r"[0-9a-f]{40}", args.commit):
             fail("--commit must be a full 40-character Git SHA")
         state_data = load_state(args.ticket)
+        if state_data.get("pending_amendment"):
+            fail("A post-publication amendment is pending evidence-comment recovery")
+        validate_amendment_chain(state_data)
         verify_state_identity(
             state_data,
             args,
@@ -1680,16 +2041,19 @@ def completed_evidence_comment_body(
     state_data: dict[str, Any], commit: str, pr: dict[str, Any]
 ) -> str:
     merge_commit = pr["mergeCommit"]["oid"]
-    return "\n".join(
+    lines = [
+        evidence_marker(state_data["issue"]),
+        f"## {state_data['ticket']} acceptance evidence — merged",
+        "",
+        f"- Merged pull request: {pr['url']}",
+        f"- Accepted publication commit: {immutable_commit_url(commit)}",
+        f"- Merge commit: {immutable_commit_url(merge_commit)}",
+        f"- Evidence manifest: {immutable_evidence_url(commit, state_data['evidence'])}",
+        f"- Merged at: {pr['mergedAt']}",
+    ]
+    lines.extend(publication_history_lines(state_data))
+    lines.extend(
         [
-            evidence_marker(state_data["issue"]),
-            f"## {state_data['ticket']} acceptance evidence — merged",
-            "",
-            f"- Merged pull request: {pr['url']}",
-            f"- Accepted publication commit: {immutable_commit_url(commit)}",
-            f"- Merge commit: {immutable_commit_url(merge_commit)}",
-            f"- Evidence manifest: {immutable_evidence_url(commit, state_data['evidence'])}",
-            f"- Merged at: {pr['mergedAt']}",
             "",
             "All substantive acceptance checks passed for the exact publication "
             "commit, and the pull request is merged.",
@@ -1699,17 +2063,17 @@ def completed_evidence_comment_body(
             evidence_end_marker(state_data["issue"]),
         ]
     )
+    return "\n".join(lines)
 
 
 def complete_evidence_comment(
     state_data: dict[str, Any], commit: str, pr: dict[str, Any]
 ) -> dict[str, Any]:
-    comment = json_output(
-        [
-            "gh",
-            "api",
-            f"repos/{TICKET_SLUG}/issues/comments/{state_data['comment_id']}",
-        ]
+    comment = find_issue_comment(
+        state_data["issue"],
+        comment_id=state_data.get("comment_id"),
+        comment_url=state_data.get("comment_url"),
+        marker=evidence_marker(state_data["issue"]),
     )
     body = comment.get("body") or ""
     marker = evidence_marker(state_data["issue"])
@@ -1723,26 +2087,19 @@ def complete_evidence_comment(
         # Only a helper-owned, still-exact In Review comment may be promoted.
         exact_evidence_comment(state_data, commit)
         updated_body = body[:start_index] + expected + body[end_index:]
-        comment = json_output(
-            [
-                "gh",
-                "api",
-                "-X",
-                "PATCH",
-                f"repos/{TICKET_SLUG}/issues/comments/{state_data['comment_id']}",
-                "-f",
-                f"body={updated_body}",
-            ]
+        comment = edit_issue_comment(
+            state_data["issue"], comment, updated_body
         )
-    confirmed = json_output(
-        [
-            "gh",
-            "api",
-            f"repos/{TICKET_SLUG}/issues/comments/{state_data['comment_id']}",
-        ]
+    confirmed = find_issue_comment(
+        state_data["issue"],
+        comment_id=comment.get("id"),
+        comment_url=comment.get("html_url"),
     )
     confirmed_body = confirmed.get("body") or ""
-    if expected not in confirmed_body or confirmed.get("id") != state_data["comment_id"]:
+    if (
+        expected not in confirmed_body
+        or confirmed.get("html_url") != state_data.get("comment_url")
+    ):
         fail("Merged acceptance-evidence comment verification failed")
     return confirmed
 
@@ -1758,6 +2115,9 @@ def command_complete(args: argparse.Namespace) -> None:
         if args.approval != POST_MERGE_APPROVAL:
             fail("Post-merge completion requires the exact explicit approval token")
         state_data = load_state(args.ticket)
+        if state_data.get("pending_amendment"):
+            fail("A post-publication amendment is pending evidence-comment recovery")
+        validate_amendment_chain(state_data)
         verify_state_identity(state_data, args, {"IN_REVIEW", "COMPLETE"})
         commit = state_data.get("publication_commit")
         if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -1794,17 +2154,16 @@ def command_complete(args: argparse.Namespace) -> None:
                 ]
             )
         if issue.get("state") == "OPEN":
-            json_output(
+            run(
                 [
                     "gh",
-                    "api",
-                    "-X",
-                    "PATCH",
-                    f"repos/{TICKET_SLUG}/issues/{args.issue}",
-                    "-f",
-                    "state=closed",
-                    "-f",
-                    "state_reason=completed",
+                    "issue",
+                    "close",
+                    str(args.issue),
+                    "--repo",
+                    TICKET_SLUG,
+                    "--reason",
+                    "completed",
                 ]
             )
 
@@ -1874,6 +2233,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_identity_arguments(publish)
     publish.set_defaults(handler=command_publish)
+
+    amend = subparsers.add_parser(
+        "amend",
+        help="Append an exact-head post-publication amendment without replacing history",
+    )
+    add_identity_arguments(amend)
+    amend.add_argument("--commit", required=True)
+    amend.add_argument("--verdict", required=True)
+    amend.set_defaults(handler=command_amend)
 
     mark_review = subparsers.add_parser(
         "mark-review", help="Move an exact published PASS commit to In Review"

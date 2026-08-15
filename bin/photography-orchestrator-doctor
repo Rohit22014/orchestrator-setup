@@ -9,15 +9,18 @@ const APP_ROOT = "/home/rohit/photography-portfolio-platform-app";
 const PLANNING_ROOT = "/home/rohit/photography-portfolio-platform";
 const AGENTS_ROOT = join(CONFIG_ROOT, "agents");
 const SKILLS_ROOT = join(CONFIG_ROOT, "skills");
+const RUNTIME_SUPERVISOR = "/home/rohit/.local/bin/photography-runtime-supervisor";
 
 const expectedAgents = {
-  orchestrator: ["primary", "openai/gpt-5.6-sol", "xhigh"],
-  "platform-architect": ["subagent", "openai/gpt-5.6-terra", "xhigh"],
-  "frontend-builder": ["subagent", "openai/gpt-5.6-terra", "high"],
-  "backend-builder": ["subagent", "openai/gpt-5.6-terra", "high"],
-  "privacy-security-reviewer": ["subagent", "openai/gpt-5.6-terra", "xhigh"],
-  "repo-scout": ["subagent", "openai/gpt-5.6-luna", "low"],
-  "qa-accessibility-reviewer": ["subagent", "openai/gpt-5.6-luna", "high"],
+  orchestrator: ["primary", "opencode-go/deepseek-v4-pro", "max"],
+  "platform-architect": ["subagent", "opencode-go/deepseek-v4-flash", "high"],
+  "frontend-builder": ["subagent", "opencode-go/deepseek-v4-flash", "high"],
+  "backend-builder": ["subagent", "opencode-go/deepseek-v4-flash", "high"],
+  "privacy-security-reviewer": ["subagent", "opencode-go/deepseek-v4-flash", "high"],
+  "repo-scout": ["subagent", "opencode-go/deepseek-v4-flash", "high"],
+  "qa-accessibility-reviewer": ["subagent", "opencode-go/deepseek-v4-flash", "high"],
+  "post-merge-coordinator": ["subagent", "opencode-go/deepseek-v4-flash", "high"],
+  "runtime-cleanup-coordinator": ["subagent", "opencode-go/deepseek-v4-flash", "high"],
 };
 
 const allowedDelegates = new Set([
@@ -27,6 +30,8 @@ const allowedDelegates = new Set([
   "privacy-security-reviewer",
   "repo-scout",
   "qa-accessibility-reviewer",
+  "post-merge-coordinator",
+  "runtime-cleanup-coordinator",
 ]);
 
 const requiredSkills = new Set([
@@ -39,6 +44,7 @@ const requiredSkills = new Set([
   "photo-platform-engineering",
   "photo-integration-readiness",
   "photo-orchestrator-evaluation",
+  "photo-runtime-cleanup",
 ]);
 
 const failures = [];
@@ -122,8 +128,14 @@ function validateConfig() {
   }
 
   record(config.default_agent === "orchestrator", "default agent is orchestrator");
-  record(config.model === "openai/gpt-5.6-sol", "default model is Sol");
-  record(config.small_model === "openai/gpt-5.6-luna", "small model is Luna");
+  record(
+    config.model === "opencode-go/deepseek-v4-pro",
+    "default model is DeepSeek V4 Pro",
+  );
+  record(
+    config.small_model === "opencode-go/deepseek-v4-flash",
+    "small model is DeepSeek V4 Flash",
+  );
   record(config.subagent_depth === 1, "subagent depth is one");
   record(config.share === "disabled", "sharing is disabled");
   record(config.permission?.external_directory === "deny", "global external-directory access is denied");
@@ -187,9 +199,30 @@ function validateConfig() {
         '"git push*": deny',
         '"gh api *": deny',
         '"gh pr merge*": deny',
-        '"gh project item-edit*": deny',
+        '"gh pr ready*": deny',
       ]) {
-        record(yaml.includes(denial), "orchestrator raw mutation remains denied", denial);
+        record(yaml.includes(denial), "orchestrator prohibited operation remains denied", denial);
+      }
+      record(!yaml.includes('"photography-ticket-delivery complete *": allow'), "orchestrator delegates guarded completion");
+      record(yaml.includes('"photography-ticket-delivery amend *": allow'), "orchestrator can append guarded post-publication amendments");
+      for (const exception of [
+        '"git commit -m \\"integration-02: synchronize backend into frontend for AUTH-02\\"": allow',
+        '"git push --set-upstream origin INTEGRATION/backend-into-frontend-for-auth-02": allow',
+        '"gh pr create --repo Rohit22014/photography-portfolio-platform-app --draft --base frontend --head INTEGRATION/backend-into-frontend-for-auth-02 *": allow',
+        '"gh issue comment 10 --repo Rohit22014/photography-portfolio-platform-app *": allow',
+      ]) {
+        record(yaml.includes(exception), "orchestrator has exact AUTH-02 integration publication exception", exception);
+      }
+      record(yaml.includes('"gh pr checks *": allow'), "orchestrator can poll read-only PR checks");
+      record(yaml.includes('"photography-runtime-supervisor status*": allow'), "orchestrator can inspect runtime supervisor");
+      for (const approval of [
+        '"gh issue comment*": ask',
+        '"gh issue close*": ask',
+        '"gh pr create*": ask',
+        '"gh pr close*": ask',
+        '"gh project item-edit*": ask',
+      ]) {
+        record(yaml.includes(approval), "orchestrator high-level GitHub mutation requires approval", approval);
       }
     } else {
       record(/^\s{2}task:\s*deny\s*$/m.test(yaml), name + " cannot delegate");
@@ -200,12 +233,176 @@ function validateConfig() {
         record(yaml.includes('"git commit*": deny'), name + " cannot commit");
         record(yaml.includes('"git push*": deny'), name + " cannot push");
         record(yaml.includes('"photography-ticket-delivery *": deny'), name + " cannot invoke delivery helper");
+        record(yaml.includes('"photography-runtime-supervisor status*": allow'), name + " can inspect runtime supervisor");
+      }
+      if (name === "frontend-builder") {
+        for (const requirement of [
+          "## Bounded verification and resource ownership",
+          "Never use `spawnSync`, `execFileSync`",
+          "explicit bounded deadlines",
+          "progress at least once per minute",
+          "Do not hide authoritative execution behind `grep`, `head`, or `tail`",
+          "idempotent `finally` path",
+          "Terminate only resources created by the current harness",
+          "leaves no owned listeners, processes, browser sessions, or running containers",
+        ]) {
+          record(body.includes(requirement), "frontend builder enforces bounded verification lifecycle", requirement);
+        }
+      }
+      if (name === "backend-builder") {
+        for (const requirement of [
+          "## Bounded verification and resource ownership",
+          "explicit bounded deadlines",
+          "idempotent",
+          "Attach non-throwing error listeners",
+          "close consumers before producers",
+          "photography-runtime-supervisor status",
+          "SIGKILL",
+          "Docker removal",
+        ]) {
+          record(body.includes(requirement), "backend builder enforces bounded verification lifecycle", requirement);
+        }
+      }
+      if (name === "qa-accessibility-reviewer") {
+        record(!/^\s{2}webfetch:\s*allow\s*$/m.test(yaml), "QA reviewer cannot webfetch GitHub API");
+        record(!/^\s{2}websearch:\s*allow\s*$/m.test(yaml), "QA reviewer cannot websearch around CLI controls");
+        record(yaml.includes('"gh api *": deny'), "QA reviewer denies gh api");
+        for (const command of [
+          '"gh issue view *": allow',
+          '"gh pr view *": allow',
+          '"gh pr list *": allow',
+          '"gh project item-list *": allow',
+          '"gh project view *": allow',
+        ]) {
+          record(yaml.includes(command), "QA reviewer uses read-only high-level GitHub CLI", command);
+        }
+      }
+      if (name === "post-merge-coordinator") {
+        record(!/^\s{2}webfetch:\s*allow\s*$/m.test(yaml), "post-merge coordinator cannot webfetch GitHub API");
+        record(!/^\s{2}websearch:\s*allow\s*$/m.test(yaml), "post-merge coordinator cannot websearch around CLI controls");
+        record(yaml.includes('"gh *": deny'), "post-merge coordinator denies unlisted GitHub CLI commands");
+        record(yaml.includes('"gh api *": deny'), "post-merge coordinator denies gh api");
+        for (const command of [
+          '"gh pr ready *": allow',
+          '"gh pr merge *": allow',
+          '"photography-ticket-delivery complete *": allow',
+        ]) {
+          record(yaml.includes(command), "post-merge coordinator has narrow approved mutation", command);
+        }
+        for (const command of [
+          '"gh issue view *": allow',
+          '"gh pr view *": allow',
+          '"gh pr checks *": allow',
+          '"gh project item-list *": allow',
+        ]) {
+          record(yaml.includes(command), "post-merge coordinator uses high-level CLI evidence", command);
+        }
+        for (const requirement of [
+          "explicit approval",
+          "exact accepted SHA",
+          "Session-level `--auto` is permitted",
+          "branch and worktree remain",
+          "Do not create a branch or worktree",
+        ]) {
+          record(body.includes(requirement), "post-merge coordinator enforces approval and retention", requirement);
+        }
+      }
+      if (name === "runtime-cleanup-coordinator") {
+        record(skills.includes("photo-runtime-cleanup"), "runtime cleanup coordinator loads cleanup skill");
+        record(yaml.includes('"photography-runtime-supervisor status*": allow'), "runtime cleanup coordinator can inspect runtime supervisor");
+        for (const command of [
+          '"docker ps*": allow',
+          '"docker system df*": allow',
+          '"docker inspect *": allow',
+        ]) {
+          record(yaml.includes(command), "runtime cleanup coordinator can inventory safely", command);
+        }
+        for (const command of [
+          '"kill -TERM *": ask',
+          '"docker stop *": ask',
+          '"docker rm *": ask',
+          '"docker network rm *": ask',
+          '"docker image rm *": ask',
+          '"docker volume rm *": ask',
+        ]) {
+          record(yaml.includes(command), "runtime cleanup mutation requires approval", command);
+        }
+        for (const command of [
+          '"docker system prune*": deny',
+          '"docker container prune*": deny',
+          '"docker image prune*": deny',
+          '"docker network prune*": deny',
+          '"docker volume prune*": deny',
+          '"docker buildx prune*": deny',
+          '"docker compose * down*": deny',
+          '"pkill *": deny',
+          '"rm *": deny',
+          '"git worktree remove*": deny',
+        ]) {
+          record(yaml.includes(command), "runtime cleanup broad destruction remains denied", command);
+        }
+        for (const requirement of [
+          "Do not classify a resource from its name alone",
+          "separate explicit approval",
+          "Revalidate identity and state immediately before acting",
+          "Preserve ticket branches, worktrees, acceptance evidence",
+          "retain its OpenCode parent and worktree",
+          "high-confidence terminal marker",
+          "This exception grants this",
+          "LLM agent no additional mutation authority",
+        ]) {
+          record(body.includes(requirement), "runtime cleanup coordinator enforces ownership and retention", requirement);
+        }
       }
     }
   }
 
-  record(existsSync("/home/rohit/.local/bin/opencode-photography-app"), "dedicated OpenCode wrapper exists");
-  record(existsSync("/home/rohit/.local/bin/photography-ticket-delivery"), "guarded ticket-delivery helper exists");
+  const opencodeWrapper = "/home/rohit/.local/bin/opencode-photography-app";
+  record(existsSync(opencodeWrapper), "dedicated OpenCode wrapper exists");
+  if (existsSync(opencodeWrapper)) {
+    record(
+      /^export OPENCODE_ENABLE_EXA=1$/m.test(read(opencodeWrapper)),
+      "dedicated wrapper enables Exa WebSearch",
+    );
+    const wrapper = read(opencodeWrapper);
+    record(wrapper.includes('PHOTOGRAPHY_RUNTIME_SUPERVISOR_MODE="high-confidence-auto-term"'), "wrapper selects high-confidence automatic termination mode");
+    record(wrapper.includes('setsid "${photography_runtime_supervisor}" monitor'), "wrapper launches detached runtime supervisor");
+    record(!wrapper.includes('"--auto is prohibited for the guarded photography workflow"'), "wrapper accepts owner-authorized auto mode");
+    record(wrapper.includes('exec /home/rohit/.npm-global/bin/opencode "$@"'), "wrapper preserves OpenCode PID through exec");
+  }
+  record(existsSync(RUNTIME_SUPERVISOR), "runtime supervisor exists", RUNTIME_SUPERVISOR);
+  if (existsSync(RUNTIME_SUPERVISOR)) {
+    const supervisor = read(RUNTIME_SUPERVISOR);
+    record(supervisor.includes('"mode": "high-confidence-auto-term"'), "runtime supervisor records automatic mode");
+    record(supervisor.includes("def high_confidence_proof("), "runtime supervisor requires deterministic proof");
+    record(supervisor.includes("def select_verifier_processes("), "runtime supervisor selects executable verifier leaves over shell wrappers");
+    record(supervisor.includes("def revalidate_exact_verifier("), "runtime supervisor revalidates exact verifier identity");
+    record(supervisor.includes("tracked-descendant-continuity"), "runtime supervisor safely tracks reparented verifier identity continuity");
+    record(supervisor.includes("stopped_ticket_containers"), "runtime supervisor requires stopped ticket containers");
+    record(supervisor.includes('os.kill(verifier["pid"], signal.SIGTERM)'), "runtime supervisor signals only the exact verifier PID");
+    record(!supervisor.includes("signal.SIGKILL"), "runtime supervisor never uses SIGKILL");
+    record(!/\[\s*["']docker["']\s*,\s*["'](?:stop|rm|rmi|compose|system|container|image|network|volume|builder|buildx)["']/s.test(supervisor), "runtime supervisor performs no Docker mutation");
+    record(!/git\s+(?:clean|reset|checkout|worktree|branch)|os\.remove|os\.unlink|shutil\.rmtree/.test(supervisor), "runtime supervisor performs no Git or filesystem cleanup");
+  }
+  const deliveryHelper = "/home/rohit/.local/bin/photography-ticket-delivery";
+  record(existsSync(deliveryHelper), "guarded ticket-delivery helper exists");
+  if (existsSync(deliveryHelper)) {
+    const helper = read(deliveryHelper);
+    record(/subparsers\.add_parser\(\s*["']amend["']/s.test(helper), "delivery helper exposes append-only amend command");
+    record(helper.includes("validate_amendment_chain"), "delivery helper validates append-only amendment history");
+    record(helper.includes("Post-publication amendment changed the acceptance-evidence blob"), "delivery helper preserves exact evidence blobs across amendments");
+    record(!/["']gh["']\s*,\s*["']api["']/s.test(helper), "delivery helper excludes gh api");
+    record(!/api\.github\.com|\/graphql\b/i.test(helper), "delivery helper excludes direct GitHub REST and GraphQL");
+    for (const command of [
+      /["']gh["']\s*,\s*["']issue["']\s*,\s*["']view["']/s,
+      /["']gh["']\s*,\s*["']issue["']\s*,\s*["']comment["']/s,
+      /["']gh["']\s*,\s*["']issue["']\s*,\s*["']close["']/s,
+      /["']gh["']\s*,\s*["']pr["']\s*,\s*["']create["']/s,
+      /["']gh["']\s*,\s*["']project["']\s*,\s*["']item-edit["']/s,
+    ]) {
+      record(command.test(helper), "delivery helper uses high-level GitHub CLI", command.source);
+    }
+  }
 }
 
 function validateSkills() {
@@ -296,6 +493,7 @@ function configurationHash() {
     join(CONFIG_ROOT, "AGENTS.md"),
     join(CONFIG_ROOT, "WORKFLOW.md"),
     "/home/rohit/.local/bin/opencode-photography-app",
+    RUNTIME_SUPERVISOR,
     "/home/rohit/.local/bin/photography-ticket-delivery",
     "/home/rohit/.local/bin/photography-orchestrator-doctor",
     ...readdirSync(AGENTS_ROOT).filter((file) => file.endsWith(".md")).sort().map((file) => join(AGENTS_ROOT, file)),
