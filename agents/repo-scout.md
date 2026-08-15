@@ -1,8 +1,8 @@
 ---
 description: Locates relevant files, patterns, tests, contracts, and dependency state without editing
 mode: subagent
-model: openai/gpt-5.6-luna
-reasoningEffort: low
+model: opencode-go/deepseek-v4-flash
+reasoningEffort: high
 permission:
   "*": deny
   read: allow

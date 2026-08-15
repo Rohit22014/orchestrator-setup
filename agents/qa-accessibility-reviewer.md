@@ -1,7 +1,7 @@
 ---
 description: Reviews tests, WCAG journeys, responsive states, regressions, privacy behavior, and acceptance evidence without editing
 mode: subagent
-model: openai/gpt-5.6-luna
+model: opencode-go/deepseek-v4-flash
 reasoningEffort: high
 permission:
   "*": deny
@@ -10,8 +10,6 @@ permission:
   grep: allow
   list: allow
   lsp: allow
-  webfetch: allow
-  websearch: allow
   question: allow
   skill:
     "*": deny
@@ -35,6 +33,14 @@ permission:
     "git show": allow
     "git show --stat": allow
     "git branch --show-current": allow
+    "gh *": deny
+    "gh auth status*": allow
+    "gh issue view *": allow
+    "gh pr view *": allow
+    "gh pr list *": allow
+    "gh project item-list *": allow
+    "gh project view *": allow
+    "gh api *": deny
     "node scripts/verify-ux-01.mjs": allow
   edit: deny
   external_directory: deny
@@ -48,3 +54,8 @@ Check happy paths and failures across keyboard-only use, screen-reader semantics
 Include privacy regressions: originals and private metadata never appear, country-only and hidden locations remain protected, public derivatives are correct, and unauthorized or removed content is not cached or indexed.
 
 Report findings by severity with reproduction steps, expected behavior, affected criterion, and missing test or evidence. State explicitly when no finding exists. Do not delegate or edit.
+
+For GitHub acceptance metadata, use only the allowlisted high-level `gh`
+commands. Never call `gh api`, `api.github.com`, REST, GraphQL, `webfetch`, or
+`websearch`; if the required metadata is unavailable through the allowlisted
+CLI reads, stop and report the blocker.

@@ -1,8 +1,8 @@
 ---
 description: Reviews authorization, uploads, private media, EXIF and GPS separation, derivatives, and public metadata without editing
 mode: subagent
-model: openai/gpt-5.6-terra
-reasoningEffort: xhigh
+model: opencode-go/deepseek-v4-flash
+reasoningEffort: high
 permission:
   "*": deny
   read: allow

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Runtime Cleanup"
+  short_description: "Safely clean ticket-owned runtime resources"
+  default_prompt: "Use $photo-runtime-cleanup to inventory and safely clean explicitly approved ticket-owned runtime resources."
